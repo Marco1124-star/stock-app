@@ -2264,7 +2264,7 @@ def get_technicals(ticker):
 
         # SMA ed EMA già presenti
         for period in ma_periods:
-            sma = close.rolling(window=period).mean().fillna(method="bfill").iloc[-1]
+            sma = close.rolling(window=period).mean().bfill().iloc[-1]
             action = "Buy" if close.iloc[-1] > sma else "Sell" if close.iloc[-1] < sma else "Neutral"
             ma_summary.append({"name": f"SMA{period}", "value": round(sma,2), "action": action})
 
@@ -3115,7 +3115,7 @@ def get_seasonality(ticker):
     
 # ---------------------- Supply/Demand Functions ----------------------
 def calculate_supply_demand_zones(hist, bins=50, window=2, strength_percentile=75, pivot_source="close"):
-    hist = hist.copy().fillna(method='ffill')
+    hist = hist.copy().ffill()
     price_min = hist['Low'].min()
     price_max = hist['High'].max()
     bin_edges = np.linspace(price_min, price_max, bins + 1)
