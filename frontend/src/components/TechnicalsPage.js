@@ -23,7 +23,7 @@ export default function TechnicalsPage({ darkMode }) {
   const [timeframe, setTimeframe] = useState("1d");
 
   const [loadingTechnicals, setLoadingTechnicals] = useState(true);
-  const [loadingCorr, setLoadingCorr] = useState(true);
+  const [, setLoadingCorr] = useState(true);
 
   const [error, setError] = useState(null);
   const [isPhoneViewport, setIsPhoneViewport] = useState(() => {

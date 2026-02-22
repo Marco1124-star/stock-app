@@ -109,12 +109,11 @@ const ChartWrapper = forwardRef(({ data, darkMode, chartType }, ref) => {
     // Calcola min/max y
     let yValues = [];
     if (chartType === "candlestick") {
-      const candles = chartData.datasets[0]?.data || [];
-      yValues = candles.flatMap((d) => [d.h, d.l]);
+      yValues = (data || []).flatMap((d) => [d.high, d.low]);
     } else {
-      const points = chartData.datasets[0]?.data || [];
-      yValues = points.map((d) => d.y);
+      yValues = (data || []).map((d) => d.close);
     }
+    yValues = yValues.filter((v) => Number.isFinite(v));
     if (!yValues.length) return;
     const yMin = Math.min(...yValues);
     const yMax = Math.max(...yValues);

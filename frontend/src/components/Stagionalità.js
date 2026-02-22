@@ -202,23 +202,6 @@ useEffect(() => {
     fetchBenchmark();
   }, [benchmarkTicker, excludeOutliers]);
 
-
-  /* ============================= BENCHMARK INPUT ============================= */
-  function BenchmarkInput({ value, onChange }) {
-    return (
-      <div className="benchmark-container">
-        <input
-          type="text"
-          placeholder="Inserisci ticker benchmark"
-          value={value}
-          onChange={(e) => onChange(e.target.value.toUpperCase())}
-          className="benchmark-input"
-        />
-        <button className="benchmark-btn" onClick={() => setBenchmarkTicker(value)}>Confronta</button>
-      </div>
-    );
-  }
-
   /* ============================= RANGE SLIDER ============================= */
   const handleThumbDrag = (type, e) => {
     e.preventDefault();
