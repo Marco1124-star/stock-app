@@ -1,0 +1,7 @@
+Flask
+flask-cors
+Werkzeug
+yfinance
+pandas
+numpy
+gunicorn

@@ -1,0 +1,913 @@
+/* PAGE */
+.stagionalita-page {
+  padding: 20px;
+  font-family: Inter, 'Segoe UI', Roboto, system-ui, -apple-system, "Helvetica Neue", Arial;
+  color: #e6eef6;
+  background: linear-gradient(180deg, #0b1220 0%, #09121b 100%);
+  min-height: 100vh;
+  box-sizing: border-box;
+}
+
+.stagionalita-page.light {
+  background: linear-gradient(180deg, #f5f7fb 0%, #eef2fb 100%);
+  color: #071027;
+}
+
+.page-title {
+  font-size: 26px;
+  font-weight: 700;
+  margin-bottom: 20px;
+  text-align: center;
+}
+
+/* ---------------------- */
+/* RANGE SLIDER ANNI – ULTIMO DESIGN */
+.year-range-container {
+  position: relative;
+  width: 70%;
+  margin: 60px auto 80px auto;
+  height: 12px;
+  border-radius: 10px;
+  background: rgba(255,255,255,0.05);
+  backdrop-filter: blur(6px);
+  box-shadow: inset 0 1px 4px rgba(0,0,0,0.3);
+}
+
+.stagionalita-page.light .year-range-container {
+  background: rgba(67,70,137,0.1);
+  backdrop-filter: none;
+  box-shadow: inset 0 1px 4px rgba(0,0,0,0.1);
+}
+
+.slider-track {
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  border-radius: 10px;
+  background: linear-gradient(90deg, rgba(255,255,255,0.2), rgba(255,255,255,0.05));
+}
+
+.stagionalita-page.light .slider-track {
+  background: linear-gradient(90deg, #d0d3f2, #e0e3f2);
+}
+
+.slider-range {
+  position: absolute;
+  height: 100%;
+  border-radius: 10px;
+  background: linear-gradient(180deg,#2bd3b1,#1fbf9b);
+
+  transition: all 0.25s ease;
+}
+
+.slider-thumb {
+  position: absolute;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 20px;
+  height: 20px;
+  background: #fff;
+  border: 2px solid #22c55e;
+  border-radius: 50%;
+  cursor: pointer;
+  z-index: 10;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.25);
+  transition: all 0.2s ease;
+  touch-action: none;
+}
+
+.slider-thumb:hover {
+  transform: translate(-50%, -50%) scale(1.2);
+  box-shadow: 0 0 12px rgba(34,197,94,0.7), 0 4px 12px rgba(0,0,0,0.4);
+}
+
+.slider-thumb span {
+  position: absolute;
+  top: -36px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0,0,0,0.8);
+  color: #fff;
+  padding: 4px 8px;
+  font-size: 0.85em;
+  font-weight: 600;
+  border-radius: 4px;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s ease, top 0.2s ease;
+}
+
+.slider-thumb:hover span {
+  top: -44px;
+  opacity: 1;
+}
+
+.stagionalita-page.light .slider-thumb span {
+  background: #434689;
+  color: #fff;
+}
+
+/* ---------------------- */
+/* Middle handle (drag range) */
+/* Middle handle ovale con puntini */
+.slider-middle {
+  position: absolute;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 50px;
+  height: 20px;
+  background: linear-gradient(145deg, #22c55e, #16a34a);
+  border-radius: 12px;
+  cursor: grab;
+  z-index: 9;
+ 
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s ease;
+  touch-action: none;
+}
+
+/* Puntini centrali */
+.slider-middle::before,
+.slider-middle::after {
+  content: "";
+  width: 4px;
+  height: 4px;
+  background: rgba(255,255,255,0.9);
+  border-radius: 50%;
+  margin: 0 2px;
+  box-shadow: 0 0 2px rgba(0,0,0,0.3);
+}
+
+.slider-middle::after {
+  margin-left: 6px;
+}
+
+.slider-middle:active {
+  cursor: grabbing;
+  transform: translate(-50%, -50%) scale(1.1);
+  box-shadow: 0 0 12px rgba(34,197,94,0.9), 0 4px 14px rgba(0,0,0,0.4);
+}
+
+.slider-middle:hover {
+  transform: translate(-50%, -50%) scale(1.15);
+  box-shadow: 0 0 14px rgba(34,197,94,0.8), 0 4px 12px rgba(0,0,0,0.35);
+}
+
+
+/* ---------------------- */
+/* Indicatori anni selezionati */
+.year-indicator {
+  position: absolute;
+  top: -18px;
+  width: 4px;
+  height: 12px;
+  background: #22c55e;
+  border-radius: 2px;
+}
+
+.stagionalita-page.light .year-indicator {
+  background: #434689;
+}
+
+/* Numeri anni fissi sopra la barra ogni 5 anni */
+.year-labels {
+  position: absolute;
+  width: 100%;
+  top: -30px;
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.85em;
+  font-weight: 600;
+  color: #fff;
+}
+
+.stagionalita-page.light .year-labels {
+  color: #434689;
+}
+
+/* Glow animato del range */
+@keyframes glow {
+  0% { box-shadow: 0 0 12px rgba(34,197,94,0.4), 0 0 20px rgba(34,197,94,0.3) inset; }
+  50% { box-shadow: 0 0 18px rgba(34,197,94,0.6), 0 0 25px rgba(34,197,94,0.4) inset; }
+  100% { box-shadow: 0 0 12px rgba(34,197,94,0.4), 0 0 20px rgba(34,197,94,0.3) inset; }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+/* ---------------------- */
+/* PANEL GRAFICO          */
+/* ---------------------- */
+.panel {
+  background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.02));
+  padding: 22px;
+  border-radius: 20px;
+  box-shadow: 0 10px 25px rgba(0,0,0,0.25);
+  color: #e6eef6;
+}
+
+.stagionalita-page.light .panel {
+  background: #ffffff;
+  color: #071027;
+  box-shadow: 0 8px 20px rgba(0,0,0,0.1);
+}
+
+
+
+
+
+
+
+
+
+
+.view-toggle {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 15px;
+}
+
+.view-toggle button {
+  padding: 6px 14px;
+  border-radius: 8px;
+  border: 1px solid rgba(255,255,255,0.25);
+  background: transparent;
+  color: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.view-toggle button.active {
+  background: #434689;
+  color: #fff;
+  border-color: #434689;
+}
+
+/* TABLE */
+.seasonality-table-wrapper {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.seasonality-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.seasonality-table th,
+.seasonality-table td {
+  padding: 8px 10px;
+  text-align: center;
+  border-bottom: 1px solid rgba(255,255,255,0.1);
+}
+
+.seasonality-table th {
+  font-weight: 700;
+}
+
+.seasonality-table td.pos {
+  color: #2bd3b1;
+  font-weight: 600;
+}
+
+.seasonality-table td.neg {
+  color: #e34646;
+  font-weight: 600;
+}
+
+
+
+
+
+
+/* =============================== */
+/* Benchmark search – integrated   */
+/* =============================== */
+.view-toggle-benchmark {
+  display: flex;
+  align-items: center;      /* 🔴 allineamento verticale perfetto */
+  gap: 0px;
+  width: 100%;
+  margin-bottom: 18px;
+}
+
+/* Pulsanti */
+.view-toggle {
+  display: flex;
+  gap: 10px;
+}
+
+.view-toggle button {
+  height: 42px;             /* 🔴 stessa altezza della barra */
+  padding: 0 18px;
+  border-radius: 999px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+}
+
+/* Stato attivo */
+.view-toggle button.active {
+  background: #434689;
+  color: #fff;
+  border-color: #434689;
+}
+
+/* Benchmark container */
+.benchmark-container {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 18px;
+}
+
+/* Wrapper pill */
+.benchmark-input-wrapper {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  max-width: 520px;
+  padding: 4px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  overflow: hidden;               /* 🔴 FONDAMENTALE */
+  transition: border 0.25s ease, box-shadow 0.25s ease;
+}
+
+/* Input perfettamente integrato */
+.benchmark-input {
+  flex: 1;
+  height: 42px;                   /* 🔴 forza altezza coerente */
+  padding: 0 18px;
+  font-size: 14px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  outline: none;
+  border-radius: 999px 0px 0px 999px;           /* 🔴 sicurezza extra */
+}
+
+
+
+/* Light mode */
+.stagionalita-page.light .benchmark-input-wrapper {
+  background: #ffffff;
+  border: 1px solid rgba(67, 70, 137, 0.25);
+}
+
+/* Focus state */
+.benchmark-input-wrapper:focus-within {
+  border-color: #2bd3b1;
+  box-shadow: 0 0 12px rgba(43, 211, 177, 0.45);
+}
+
+
+.benchmark-input::placeholder {
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.stagionalita-page.light .benchmark-input::placeholder {
+  color: rgba(7, 16, 39, 0.45);
+}
+
+/* Bottone integrato */
+.benchmark-submit {
+  padding: 10px 22px;
+  border-radius: 0px 999px 999px 0px;
+  border: none;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+  background: linear-gradient(135deg, #2bd3b1, #1fbfa3);
+  color: #0b1220;
+  transition: all 0.2s ease;
+}
+
+/* Hover */
+.benchmark-submit:hover {
+  transform: translateX(-1px);
+  filter: brightness(1.05);
+}
+
+/* Active */
+.benchmark-submit:active {
+  transform: scale(0.96);
+}
+
+/* Light mode button */
+.stagionalita-page.light .benchmark-submit {
+  background: linear-gradient(135deg, #434689, #2f3162);
+  color: #ffffff;
+}
+
+/* Responsive */
+@media (max-width: 900px) {
+  .view-toggle-benchmark {
+    flex-wrap: wrap;
+  }
+
+  .benchmark-container {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .benchmark-input-wrapper {
+    max-width: 100%;
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+/* Card principale */
+.analysis-card {
+  width: 100%;
+  padding: 22px 24px;
+  border-radius: 20px;
+  background: linear-gradient(
+    180deg,
+    rgba(255,255,255,0.06),
+    rgba(255,255,255,0.02)
+  );
+  border: 1px solid rgba(255,255,255,0.12);
+}
+
+/* Card style unificato */
+.stagionalita-page .season-card {
+  background: linear-gradient(165deg, rgba(255,255,255,0.04), rgba(255,255,255,0.01));
+  border: 1px solid rgba(255,255,255,0.08);
+  box-shadow: 0 12px 24px rgba(0,0,0,0.28);
+  border-radius: 18px;
+}
+
+.stagionalita-page.light .season-card {
+  background: #ffffff;
+  border-color: #e5e7eb;
+  box-shadow: 0 8px 18px rgba(15,23,42,0.1);
+}
+
+/* Light mode */
+.stagionalita-page.light .analysis-card {
+  background: #ffffff;
+  border: 1px solid rgba(67,70,137,0.18);
+}
+
+/* Top actions */
+.top-box {
+  display: flex;
+  justify-content: space-between; /* spinge le card ai margini e centra quella di mezzo */
+  align-items: center;
+  width: 100%;
+  margin-bottom: 20px;
+  gap: 16px; /* distanza tra le card se vuoi maggiore respiro */
+  box-shadow: none;
+}
+
+/* Card navigazione (Cerca / Previsioni / Tecnici) */
+.stagionalita-page .ticker-card-modern {
+  cursor: pointer;
+  flex-shrink: 0;
+  width: 150px;
+  background: linear-gradient(145deg, #434689, #2b2b50);
+  color: #f5f7ff;
+  padding: 16px;
+  border-radius: 12px;
+  box-shadow: 0 10px 22px rgba(0,0,0,0.28);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  transition: transform 0.25s ease, box-shadow 0.25s ease, background 0.2s ease;
+}
+
+.stagionalita-page .ticker-card-modern:hover {
+  transform: translateY(-3px) scale(1.015);
+  box-shadow: 0 16px 30px rgba(0,0,0,0.3);
+  background: linear-gradient(145deg, #4a4ea0, #323365);
+}
+
+.stagionalita-page .ticker-card-modern .ticker-card-icon {
+  font-size: 1.8em;
+  margin-bottom: 8px;
+  color: rgba(255,255,255,0.85);
+}
+
+.stagionalita-page .ticker-card-modern .ticker-card-symbol {
+  font-size: 1.3em;
+  font-weight: 600;
+  margin-bottom: 6px;
+  text-align: center;
+}
+
+.stagionalita-page .ticker-card-modern .ticker-card-text {
+  font-size: 0.85em;
+  opacity: 0.85;
+  text-align: center;
+  line-height: 1.2;
+}
+
+.stagionalita-page.light .ticker-card-modern {
+  background: linear-gradient(145deg, #434689, #2b2b50);
+  color: #f5f7ff;
+  border: 1px solid rgba(255,255,255,0.14);
+  box-shadow: 0 12px 24px rgba(15,23,42,0.18);
+}
+
+.stagionalita-page.light .ticker-card-modern:hover {
+  background: linear-gradient(145deg, #4a4ea0, #323365);
+  box-shadow: 0 16px 30px rgba(15,23,42,0.22);
+}
+
+.stagionalita-page.light .ticker-card-modern .ticker-card-icon {
+  color: rgba(255,255,255,0.85);
+}
+
+.stagionalita-page.light .ticker-card-modern .ticker-card-text {
+  opacity: 0.9;
+}
+
+@media (max-width: 768px) {
+  .stagionalita-page .ticker-card-modern {
+    width: 100%;
+    flex-direction: row;
+    justify-content: space-between;
+    padding: 12px 16px;
+  }
+
+  .stagionalita-page .ticker-card-modern .ticker-card-icon {
+    font-size: 1.5em;
+  }
+
+  .stagionalita-page .ticker-card-modern .ticker-card-symbol {
+    font-size: 1.1em;
+  }
+
+  .stagionalita-page .ticker-card-modern .ticker-card-text {
+    font-size: 0.8em;
+  }
+}
+
+
+/* Divider elegante */
+.analysis-divider {
+  height: 1px;
+  margin: 18px 0;
+  background: linear-gradient(
+    to right,
+    transparent,
+    rgba(255,255,255,0.25),
+    transparent
+  );
+}
+
+.stagionalita-page.light .analysis-divider {
+  background: linear-gradient(
+    to right,
+    transparent,
+    rgba(67,70,137,0.25),
+    transparent
+  );
+}
+
+
+
+
+
+
+
+/* =============================== */
+/* KPI STAGIONALITÀ – ROW          */
+/* =============================== */
+.seasonality-kpi-row {
+  display: flex;
+  justify-content: space-between; /* primo a sinistra, secondo al centro, terzo a destra */
+  gap: 20px;
+  margin-top: 20px;
+  margin-bottom: 20px;
+  flex-wrap: wrap;
+}
+
+.seasonality-kpi {
+  flex: 1 1 200px; /* larghezza minima, si espande */
+  background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.02));
+  border-radius: 16px;
+  padding: 16px 20px;
+  box-shadow: 0 6px 15px rgba(0,0,0,0.25);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  transition: all 0.2s ease;
+}
+
+.stagionalita-page.light .seasonality-kpi {
+  background: #ffffff;
+  color: #071027;
+  box-shadow: 0 6px 15px rgba(0,0,0,0.1);
+}
+
+/* Hover effect */
+.seasonality-kpi:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 10px 20px rgba(0,0,0,0.3);
+}
+
+/* Label, value e subtext */
+.seasonality-kpi .kpi-label {
+  font-size: 14px;
+  font-weight: 600;
+  color: #aaa;
+  margin-bottom: 6px;
+}
+
+.seasonality-kpi .kpi-value {
+  font-size: 22px;
+  font-weight: 700;
+  color: #2bd3b1;
+}
+
+.seasonality-kpi .kpi-sub {
+  font-size: 14px;
+  margin-top: 4px;
+  font-weight: 600;
+}
+
+.seasonality-kpi .kpi-sub.pos {
+  color: #2bd3b1;
+}
+
+.seasonality-kpi .kpi-sub.neg {
+  color: #e34646;
+}
+
+/* Responsive */
+@media (max-width: 900px) {
+  .seasonality-kpi-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .seasonality-kpi {
+    width: 100%;
+  }
+}
+
+
+
+
+
+.seasonality-kpi-row {
+  display: flex;
+  gap: 20px;
+  margin-top: 20px;
+}
+
+.seasonality-kpi.trade-month {
+  padding: 15px 25px;
+  border-radius: 12px;
+  box-shadow: 0 4px 10px rgba(0,0,0,0.15);
+  text-align: center;
+  flex: 1;
+  transition: transform 0.2s;
+}
+
+.seasonality-kpi.trade-month:hover {
+  transform: translateY(-3px);
+}
+
+/* Testi colorati solo per le etichette */
+.seasonality-kpi.trade-month.buy .kpi-label {
+  color: #52c41a; /* verde */
+}
+
+.seasonality-kpi.trade-month.sell .kpi-label {
+  color: #ff4d4f; /* rosso */
+}
+
+/* Nome del mese */
+.seasonality-kpi.trade-month .kpi-value {
+  font-size: 1.5em;
+  font-weight: 700;
+  color: #fff; /* bianco per dark mode */
+}
+
+/* Light mode: testi mesi neri */
+.stagionalita-page.light .seasonality-kpi.trade-month .kpi-value {
+  color: #000; 
+}
+
+@media (max-width: 560px) {
+  .stagionalita-page {
+    padding: 10px 12px;
+  }
+
+  .analysis-card {
+    padding: 12px;
+    border-radius: 16px;
+  }
+
+  .page-title {
+    font-size: 1.15rem;
+    line-height: 1.2;
+    margin-bottom: 14px;
+  }
+
+  .year-range-container {
+    width: 100%;
+    height: 10px;
+    margin: 44px auto 58px;
+    padding: 0;
+    border-radius: 12px;
+  }
+
+  .year-labels {
+    top: -24px;
+    font-size: 0.62rem;
+    line-height: 1;
+    overflow: hidden;
+  }
+
+  .panel {
+    padding: 12px;
+    border-radius: 14px;
+  }
+
+  .top-box {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .benchmark-input-wrapper {
+    gap: 8px;
+    flex-direction: column;
+    align-items: stretch;
+    border-radius: 14px;
+    padding: 8px;
+    overflow: visible;
+  }
+
+  .benchmark-input,
+  .benchmark-submit {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .benchmark-input {
+    height: 40px;
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.03);
+  }
+
+  .stagionalita-page.light .benchmark-input {
+    background: #f5f7fb;
+  }
+
+  .benchmark-submit {
+    min-height: 40px;
+    border-radius: 10px;
+    padding: 10px 14px;
+  }
+
+  .view-toggle-benchmark {
+    gap: 8px;
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .view-toggle {
+    width: 100%;
+    gap: 8px;
+    margin-bottom: 0;
+    flex-wrap: wrap;
+  }
+
+  .view-toggle button {
+    flex: 1 1 calc(50% - 4px);
+    min-width: 0;
+    height: auto;
+    min-height: 40px;
+    padding: 8px 10px;
+    border-radius: 12px;
+    white-space: normal;
+    line-height: 1.15;
+    text-align: center;
+  }
+
+  .benchmark-container {
+    width: 100%;
+    margin-bottom: 0;
+    justify-content: stretch;
+  }
+
+  .analysis-divider {
+    margin: 12px 0;
+  }
+
+  .seasonality-kpi-row {
+    gap: 10px;
+    margin-top: 12px;
+    margin-bottom: 12px;
+  }
+
+  .seasonality-kpi {
+    padding: 12px 14px;
+    border-radius: 12px;
+  }
+
+  .seasonality-kpi .kpi-label,
+  .seasonality-kpi .kpi-sub {
+    font-size: 0.8rem;
+  }
+
+  .seasonality-kpi .kpi-value {
+    font-size: 1.2rem;
+  }
+
+  .seasonality-kpi.trade-month {
+    padding: 12px 14px;
+    border-radius: 12px;
+  }
+
+  .stagionalita-page .ticker-card-modern {
+    padding: 10px 12px;
+    border-radius: 12px;
+  }
+
+  .stagionalita-page .ticker-card-modern .ticker-card-icon {
+    font-size: 1.15rem;
+    margin-bottom: 0;
+  }
+
+  .stagionalita-page .ticker-card-modern .ticker-card-symbol {
+    font-size: 0.95rem;
+  }
+
+  .stagionalita-page .ticker-card-modern .ticker-card-text {
+    font-size: 0.75rem;
+  }
+
+  .seasonality-table {
+    min-width: 560px;
+    font-size: 0.78rem;
+  }
+
+  .seasonality-table th,
+  .seasonality-table td {
+    padding: 6px 8px;
+  }
+
+  .seasonality-ranking {
+    margin-top: 12px;
+    padding: 12px;
+    border-radius: 14px;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .seasonality-ranking h3 {
+    margin: 0 0 10px;
+    font-size: 0.95rem;
+    line-height: 1.25;
+  }
+
+  .seasonality-ranking table {
+    width: 100%;
+    min-width: 320px;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+  }
+
+  .seasonality-ranking th,
+  .seasonality-ranking td {
+    padding: 7px 8px;
+    white-space: nowrap;
+  }
+}
