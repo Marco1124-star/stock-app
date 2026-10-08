@@ -711,6 +711,12 @@ def _get_social_reaction_snapshot(conn, portfolio_id, viewer_user_id):
 
 _init_auth_db()
 
+
+@app.route("/health")
+def healthcheck():
+    """Endpoint leggero usato dall'hosting per controllare il servizio."""
+    return jsonify({"status": "ok"}), 200
+
 # Cache rapido per endpoint /stock
 stock_response_cache = {}
 STOCK_CACHE_TTL = timedelta(seconds=120)
