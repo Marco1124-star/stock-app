@@ -714,12 +714,19 @@ const QuantitativeAnalysis = ({ darkMode }) => {
 
   const [historyPayload, setHistoryPayload] = useState(null);
   const [infoPayload, setInfoPayload] = useState(null);
+  /* Le sezioni Benchmark/Advanced sono nascoste dalla UI, ma le strutture
+     restano temporaneamente disponibili per non alterare i calcoli condivisi. */
+  // eslint-disable-next-line no-unused-vars
   const [benchmarkPayload, setBenchmarkPayload] = useState(null);
+  // eslint-disable-next-line no-unused-vars
   const [researchPayload, setResearchPayload] = useState(null);
+  // eslint-disable-next-line no-unused-vars
   const [researchLoading, setResearchLoading] = useState(false);
+  // eslint-disable-next-line no-unused-vars
   const [researchError, setResearchError] = useState("");
   const [mainLoading, setMainLoading] = useState(false);
   const [infoLoading, setInfoLoading] = useState(false);
+  // eslint-disable-next-line no-unused-vars
   const [benchmarkLoading, setBenchmarkLoading] = useState(false);
   const [multiFactorPayloads, setMultiFactorPayloads] = useState({});
   const [multiFactorErrors, setMultiFactorErrors] = useState({});
@@ -727,6 +734,7 @@ const QuantitativeAnalysis = ({ darkMode }) => {
   const [multiFactorLoading, setMultiFactorLoading] = useState(false);
   const [mainError, setMainError] = useState("");
   const [infoError, setInfoError] = useState("");
+  // eslint-disable-next-line no-unused-vars
   const [benchmarkError, setBenchmarkError] = useState("");
   const [retryKey, setRetryKey] = useState(0);
   const [isPrinting, setIsPrinting] = useState(false);
@@ -2042,6 +2050,7 @@ const QuantitativeAnalysis = ({ darkMode }) => {
     </div>
   );
 
+  // eslint-disable-next-line no-unused-vars
   const renderBenchmark = () => {
     if (benchmarkLoading) {
       return (
@@ -2597,6 +2606,7 @@ const QuantitativeAnalysis = ({ darkMode }) => {
     );
   };
 
+  // eslint-disable-next-line no-unused-vars
   const renderRegression = () => (
     <div className="quant-tab-content" role="tabpanel" id="quant-panel-regression" aria-labelledby="quant-tab-regression">
       <section className="quant-regression-model-header" aria-labelledby="quant-regression-model-title">
@@ -2833,6 +2843,7 @@ const QuantitativeAnalysis = ({ darkMode }) => {
     );
   };
 
+  // eslint-disable-next-line no-unused-vars
   const renderAdvanced = () => {
     if (!advancedQuantitative) {
       return <div className="quant-tab-content" role="tabpanel" id="quant-panel-advanced" aria-labelledby="quant-tab-advanced"><StatePanel title="Campione insufficiente">Servono almeno 40 rendimenti validi per l'analisi avanzata.</StatePanel></div>;
