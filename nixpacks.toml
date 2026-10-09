@@ -2,7 +2,7 @@
 providers = ["python"]
 
 [phases.install]
-cmds = ["pip install --no-cache-dir -r backend/requirements.txt"]
+cmds = ["pip install --no-cache-dir -r requirements.txt"]
 
 [start]
-cmd = "gunicorn --chdir backend --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 180 app:app"
+cmd = "gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 180 app:app"
