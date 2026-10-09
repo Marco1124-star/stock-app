@@ -5,3 +5,8 @@ yfinance
 pandas
 numpy
 gunicorn
+xgboost>=3.2,<4
+lightgbm>=4.6,<5
+catboost>=1.2,<2
+scipy>=1.10,<2
+scikit-learn>=1.7,<2

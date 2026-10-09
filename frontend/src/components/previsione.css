@@ -24,6 +24,80 @@
   align-items: center;
 }
 
+.supply-demand-page .previsione-nav-cards {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 16px;
+  width: 100%;
+  margin: 0 0 0;
+}
+
+.supply-demand-page .previsione-nav-cards .info-card {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  min-height: 82px;
+  padding: 17px 18px;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 13px;
+  border: 1px solid rgba(158, 177, 203, .16);
+  border-radius: 16px;
+  background: radial-gradient(circle at 100% 0, rgba(43, 211, 177, .08), transparent 42%), #101b2a;
+  box-shadow: 0 14px 34px rgba(0, 0, 0, .2);
+  color: #f3f6fb;
+  text-align: left;
+  cursor: pointer;
+  transition: transform .2s ease, border-color .2s ease, box-shadow .2s ease;
+}
+
+.supply-demand-page.light .previsione-nav-cards .info-card {
+  border-color: #e2e6ed;
+  background: radial-gradient(circle at 100% 0, rgba(43, 211, 177, .08), transparent 42%), #fff;
+  box-shadow: 0 12px 28px rgba(16, 24, 40, .08);
+  color: #14171f;
+}
+
+.supply-demand-page .previsione-nav-cards .info-card:hover {
+  transform: translateY(-3px);
+  border-color: rgba(43, 211, 177, .38);
+  box-shadow: 0 18px 38px rgba(0, 0, 0, .25);
+}
+
+.supply-demand-page .previsione-nav-cards .icon {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  flex: 0 0 44px;
+  place-items: center;
+  margin: 0;
+  border: 1px solid rgba(43, 211, 177, .18);
+  border-radius: 11px;
+  background: rgba(43, 211, 177, .1);
+  color: #2bd3b1;
+  font-size: 1.22rem;
+}
+
+.supply-demand-page.light .previsione-nav-cards .icon {
+  border-color: rgba(22, 143, 119, .16);
+  color: #168f77;
+}
+
+.supply-demand-page .previsione-nav-cards .card-title {
+  margin: 0;
+  color: inherit;
+  font-size: .98rem;
+  font-weight: 800;
+  line-height: 1.2;
+}
+
+/* Le destinazioni sono ora disponibili nella barra superiore, come in Cerca. */
+.supply-demand-page .supply-demand-card .right-cards {
+  display: none;
+}
+
 /* ================= CARD INFORMAZIONI ================= */
 .supply-demand-page .supply-demand-card {
   background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));
@@ -2178,5 +2252,384 @@
   .supply-demand-page .overview-help-tip::after {
     max-width: min(250px, calc(100vw - 28px));
     white-space: normal;
+  }
+}
+
+/* Sistema visivo condiviso con Search, Bilancio, Tecnici e Quantitativi */
+.supply-demand-page {
+  --prev-bg: #0d1724;
+  --prev-surface: #142335;
+  --prev-surface-2: #192b40;
+  --prev-border: rgba(148, 163, 184, .16);
+  --prev-text: #f3f6fb;
+  --prev-muted: #9aabc0;
+  --prev-green: #2bd3b1;
+  --prev-green-soft: rgba(43, 211, 177, .14);
+  min-height: 100vh;
+  padding: 30px clamp(16px, 3vw, 42px) 52px;
+  background: var(--prev-bg);
+  color: var(--prev-text);
+}
+
+.supply-demand-page.light {
+  --prev-bg: #f5f7fb;
+  --prev-surface: #ffffff;
+  --prev-surface-2: #f8fafc;
+  --prev-border: #e5eaf1;
+  --prev-text: #172033;
+  --prev-muted: #667085;
+  --prev-green: #168f77;
+  --prev-green-soft: rgba(22, 143, 119, .10);
+  background: var(--prev-bg);
+}
+
+.supply-demand-page .supply-demand-main {
+  width: min(100%, 1440px);
+  gap: 24px;
+  align-items: stretch;
+}
+
+.supply-demand-page .supply-demand-main > * {
+  width: 100%;
+  max-width: 1440px;
+  margin-left: auto;
+  margin-right: auto;
+  box-sizing: border-box;
+}
+
+.supply-demand-page .overview-strip-card,
+.supply-demand-page .action-panel,
+.supply-demand-page .supply-demand-card,
+.supply-demand-page .chart-card,
+.supply-demand-page .supply-chart-panel {
+  border: 1px solid var(--prev-border);
+  border-radius: 22px;
+  background: var(--prev-surface);
+  box-shadow: 0 16px 42px rgba(15, 23, 42, .14);
+}
+
+.supply-demand-page .overview-strip-card {
+  width: 100%;
+  max-width: none;
+  padding: clamp(20px, 3vw, 32px);
+}
+
+.supply-demand-page .overview-strip-head {
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--prev-border);
+}
+
+.supply-demand-page .overview-strip-symbol {
+  color: var(--prev-text);
+  font-size: clamp(1.5rem, 3vw, 2.25rem);
+  letter-spacing: -.04em;
+}
+
+.supply-demand-page .overview-signal-badge--hero {
+  border-color: rgba(43, 211, 177, .28);
+  background: var(--prev-green-soft);
+}
+
+.supply-demand-page .overview-timeframe-selector,
+.supply-demand-page .timeframe-selector {
+  gap: 6px;
+  padding: 4px;
+  border: 1px solid var(--prev-border);
+  border-radius: 13px;
+  background: var(--prev-surface-2);
+}
+
+.supply-demand-page .timeframe-selector button,
+.supply-demand-page .chart-type-selector button,
+.supply-demand-page .tech-timeframe-selector button {
+  border: 0;
+  border-radius: 9px;
+  color: var(--prev-muted);
+  background: transparent;
+  transition: background .2s ease, color .2s ease, transform .2s ease;
+}
+
+.supply-demand-page .timeframe-selector button:hover,
+.supply-demand-page .chart-type-selector button:hover,
+.supply-demand-page .tech-timeframe-selector button:hover {
+  color: var(--prev-text);
+  background: var(--prev-green-soft);
+}
+
+.supply-demand-page .timeframe-selector button.active,
+.supply-demand-page .chart-type-selector button.active,
+.supply-demand-page .tech-timeframe-selector button.active {
+  color: #fff;
+  background: var(--prev-green);
+  border-color: var(--prev-green);
+  box-shadow: 0 5px 14px rgba(22, 143, 119, .22);
+}
+
+.supply-demand-page .overview-horizon-card,
+.supply-demand-page .overview-metric,
+.supply-demand-page .overview-plan-item,
+.supply-demand-page .seasonality-kpi,
+.supply-demand-page .seasonality-current,
+.supply-demand-page .gap-kpi {
+  border-color: var(--prev-border);
+  background: var(--prev-surface-2);
+  box-shadow: none;
+}
+
+.supply-demand-page .overview-horizon-card.buy,
+.supply-demand-page .overview-metric-signal.buy {
+  border-color: rgba(43, 211, 177, .42);
+  background: linear-gradient(145deg, rgba(43, 211, 177, .18), var(--prev-surface-2));
+}
+
+.supply-demand-page .overview-horizon-card.sell,
+.supply-demand-page .overview-metric-signal.sell {
+  border-color: rgba(227, 70, 70, .38);
+}
+
+.supply-demand-page .overview-label,
+.supply-demand-page .overview-horizon-title,
+.supply-demand-page .overview-horizon-ref,
+.supply-demand-page .overview-plan-label {
+  color: var(--prev-muted);
+}
+
+.supply-demand-page .overview-value,
+.supply-demand-page .overview-horizon-main,
+.supply-demand-page .overview-plan-value {
+  color: var(--prev-text);
+}
+
+.supply-demand-page .cards-row {
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.5fr) minmax(0, .85fr);
+  gap: 24px;
+  align-items: stretch;
+}
+
+.supply-demand-page .action-panel,
+.supply-demand-page .supply-demand-card {
+  width: auto;
+  max-width: none;
+  padding: 24px;
+  text-align: left;
+}
+
+.supply-demand-page .panel-title,
+.supply-demand-page .gap-panel-header h3 {
+  color: var(--prev-text);
+  letter-spacing: .01em;
+}
+
+.supply-demand-page .panel-title {
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--prev-border);
+}
+
+.supply-demand-page .seasonality-panel,
+.supply-demand-page .tech-panel {
+  min-height: 300px;
+}
+
+.supply-demand-page .info-card-container {
+  gap: 18px;
+  align-items: stretch;
+}
+
+.supply-demand-page .left-card {
+  border: 1px solid var(--prev-border);
+  border-radius: 16px;
+  background: var(--prev-surface-2);
+}
+
+.supply-demand-page .left-card h2 {
+  color: var(--prev-text);
+  font-size: 1.12rem;
+}
+
+.supply-demand-page .right-cards {
+  gap: 10px;
+}
+
+.supply-demand-page .right-card {
+  border: 1px solid rgba(43, 211, 177, .2);
+  border-radius: 14px;
+  background: linear-gradient(145deg, #173b43, #14302f);
+  box-shadow: none;
+}
+
+.supply-demand-page.light .right-card {
+  border-color: rgba(22, 143, 119, .2);
+  background: linear-gradient(145deg, #eaf8f5, #dff2ed);
+}
+
+.supply-demand-page .right-card:hover {
+  border-color: var(--prev-green);
+  background: linear-gradient(145deg, #1d4d4c, #173b3b);
+  box-shadow: 0 10px 22px rgba(22, 143, 119, .16);
+}
+
+.supply-demand-page.light .right-card:hover {
+  background: linear-gradient(145deg, #dff2ed, #d2ece6);
+}
+
+.supply-demand-page .card-icon {
+  background: var(--prev-green-soft);
+  color: var(--prev-green);
+}
+
+.supply-demand-page .card-title,
+.supply-demand-page .card-sub {
+  color: inherit;
+}
+
+.supply-demand-page .card-sub {
+  opacity: .68;
+}
+
+.supply-demand-page .price-bar,
+.supply-demand-page .tech-strength,
+.supply-demand-page .tech-status,
+.supply-demand-page .advanced-toggle,
+.supply-demand-page .advanced-grid input,
+.supply-demand-page .apply-btn,
+.supply-demand-page .reset-btn {
+  border-color: var(--prev-border);
+  background: var(--prev-surface-2);
+  color: var(--prev-text);
+}
+
+.supply-demand-page .advanced-toggle:hover,
+.supply-demand-page .apply-btn:hover,
+.supply-demand-page .reset-btn:hover {
+  border-color: rgba(43, 211, 177, .45);
+  background: var(--prev-green-soft);
+}
+
+.supply-demand-page .chart-card {
+  width: 100%;
+  max-width: 1440px;
+  padding: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.supply-demand-page .supply-chart-panel {
+  width: 100%;
+  max-width: 1440px;
+  margin: 0 0 24px;
+  padding: 24px;
+  background: var(--prev-surface);
+}
+
+.supply-demand-page .chart-controls {
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--prev-border);
+}
+
+.supply-demand-page .gap-chart-panel {
+  margin-bottom: 0;
+}
+
+.supply-demand-page .supply-chart-panel canvas {
+  border-radius: 12px;
+}
+
+.supply-demand-page .gap-kpi strong,
+.supply-demand-page .seasonality-kpi .kpi-value {
+  color: var(--prev-green);
+}
+
+.supply-demand-page .seasonality-mini-chart {
+  margin-top: 24px;
+  padding: 18px;
+  border: 1px solid var(--prev-border);
+  border-radius: 16px;
+  background: var(--prev-surface-2);
+}
+
+.supply-demand-page .seasonality-mini-chart-title {
+  margin-bottom: 12px;
+  color: var(--prev-text);
+  font-size: .82rem;
+  font-weight: 800;
+  letter-spacing: .02em;
+}
+
+.supply-demand-page .seasonality-mini-chart-wrap {
+  height: 285px;
+  width: 100%;
+  min-width: 0;
+}
+
+.supply-demand-page .seasonality-mini-chart-wrap .js-plotly-plot,
+.supply-demand-page .seasonality-mini-chart-wrap .plot-container,
+.supply-demand-page .seasonality-mini-chart-wrap .svg-container {
+  width: 100% !important;
+  max-width: none !important;
+}
+
+@media (max-width: 1100px) {
+  .supply-demand-page .previsione-nav-cards {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .supply-demand-page .cards-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .supply-demand-page .seasonality-panel {
+    grid-column: span 1;
+  }
+
+  .supply-demand-page .supply-demand-card {
+    grid-column: span 1;
+  }
+}
+
+@media (max-width: 760px) {
+  .supply-demand-page {
+    padding: 16px 12px 32px;
+  }
+
+  .supply-demand-page .cards-row {
+    grid-template-columns: 1fr;
+  }
+
+  .supply-demand-page .previsione-nav-cards {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+  }
+
+  .supply-demand-page .seasonality-panel,
+  .supply-demand-page .supply-demand-card,
+  .supply-demand-page .tech-panel {
+    grid-column: auto;
+  }
+
+  .supply-demand-page .overview-strip-card,
+  .supply-demand-page .action-panel,
+  .supply-demand-page .supply-demand-card,
+  .supply-demand-page .supply-chart-panel {
+    padding: 16px;
+    border-radius: 17px;
+  }
+
+  .supply-demand-page .previsione-nav-cards .info-card {
+    min-height: 68px;
+    padding: 12px;
+    gap: 9px;
+  }
+
+  .supply-demand-page .previsione-nav-cards .icon {
+    width: 36px;
+    height: 36px;
+    flex-basis: 36px;
+    font-size: 1rem;
+  }
+
+  .supply-demand-page .previsione-nav-cards .card-title {
+    font-size: .86rem;
   }
 }

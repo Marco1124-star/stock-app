@@ -1,14 +1,26 @@
 import React, { useEffect, useState, useRef } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import Plot from "react-plotly.js";
-import { FiSearch, FiBarChart2, FiTrendingUp } from "react-icons/fi";
+import {
+  FiBookOpen,
+  FiBarChart2,
+  FiCalendar,
+  FiClock,
+  FiSearch,
+  FiTrendingUp,
+} from "react-icons/fi";
 import { apiUrl } from "../services/apiBase";
 import "./Stagionalita.css";
 
 export default function StagionalitaMultiYear({ darkMode }) {
   const navigate = useNavigate();
   const location = useLocation();
-  const ticker = new URLSearchParams(location.search).get("ticker");
+  const priorYearsOnly = new URLSearchParams(location.search).get("priorYearsOnly") === "1";
+  const ticker = (
+    new URLSearchParams(location.search).get("ticker") ||
+    localStorage.getItem("lastTicker") ||
+    "AAPL"
+  ).trim().toUpperCase();
 
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -17,16 +29,17 @@ export default function StagionalitaMultiYear({ darkMode }) {
   const [minYear, setMinYear] = useState(null);
   const [maxYear, setMaxYear] = useState(null);
   const [viewMode, setViewMode] = useState("chart"); // chart | table | percentile
-  const [excludeOutliers, setExcludeOutliers] = useState(false);
-  const [rawData, setRawData] = useState(null); // aggiungi questa
+  const [excludeOutliers, setExcludeOutliers] = useState(priorYearsOnly);
 
 
 
+  const [benchmarkInput, setBenchmarkInput] = useState("");
   const [benchmarkTicker, setBenchmarkTicker] = useState("");
   const [benchmarkData, setBenchmarkData] = useState(null);
 
   const rangeRef = useRef(null);
   const seasonCacheRef = useRef(new Map());
+  const selectionTickerRef = useRef(null);
   const seasonAbortRef = useRef(null);
   const benchmarkAbortRef = useRef(null);
 
@@ -72,16 +85,25 @@ useEffect(() => {
   if (!ticker) return;
 
   const fetchSeasonality = async () => {
-    const cacheKey = `${ticker}|base`;
+    if (seasonAbortRef.current) seasonAbortRef.current.abort();
+    const applyData = (json) => {
+      const years = json.years || [];
+      const keepYears = selectionTickerRef.current === ticker;
+      setData(json);
+      setMinYear((previous) => keepYears && years.includes(previous) ? previous : years[0]);
+      setMaxYear((previous) => keepYears && years.includes(previous) ? previous : years[years.length - 1]);
+      setSelectedYears((previous) => {
+        const retained = keepYears ? previous.filter((year) => years.includes(year)) : [];
+        return retained.length ? retained : years;
+      });
+      selectionTickerRef.current = ticker;
+    };
+    const cacheKey = `${ticker}|${excludeOutliers}|${priorYearsOnly}`;
     const cached = seasonCacheRef.current.get(cacheKey);
     if (cached && Date.now() - cached.ts < 5 * 60_000) {
       const json = cached.data;
-      setRawData(json);
-      setData(json);
-      const years = json.years || [];
-      setMinYear(years[0]);
-      setMaxYear(years[years.length - 1]);
-      setSelectedYears(years);
+      applyData(json);
+      setError("");
       setLoading(false);
       return;
     }
@@ -93,7 +115,7 @@ useEffect(() => {
     setLoading(true);
     setError("");
     try {
-      const res = await fetch(apiUrl(`/seasonality/${ticker}`), {
+      const res = await fetch(apiUrl(`/seasonality/${encodeURIComponent(ticker)}?exclude_outliers=${excludeOutliers}&prior_years_only=${priorYearsOnly}`), {
         signal: controller.signal
       });
       if (!res.ok) {
@@ -107,60 +129,25 @@ useEffect(() => {
         throw new Error(msg);
       }
       const json = await res.json();
+      if (controller.signal.aborted) return;
       seasonCacheRef.current.set(cacheKey, { ts: Date.now(), data: json });
 
-      setRawData(json);   // salva i dati originali
-      setData(json);      // dati iniziali visibili
-      const years = json.years || [];
-      setMinYear(years[0]);
-      setMaxYear(years[years.length - 1]);
-      setSelectedYears(years);
+      applyData(json);
     } catch (e) {
-      if (e?.name === "AbortError") return;
+      if (controller.signal.aborted || e?.name === "AbortError") return;
       console.error(e);
       setError(e.message || "Impossibile caricare l’analisi di stagionalità");
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) setLoading(false);
     }
   };
 
   fetchSeasonality();
-}, [ticker]); // RIMUOVI excludeOutliers dai dependency
+}, [ticker, excludeOutliers, priorYearsOnly]);
 
 
 
-useEffect(() => {
-  if (!rawData) return;
-
-  if (excludeOutliers) {
-    // Soglie globali su tutti i mesi/anni, poi clamp per ogni cella valida
-    const allValues = Object.values(rawData.seasonalCurveByYear || {})
-      .flat()
-      .filter((v) => Number.isFinite(v));
-
-    if (allValues.length === 0) {
-      setData(rawData);
-      return;
-    }
-
-    const sorted = [...allValues].sort((a, b) => a - b);
-    const minVal = sorted[Math.floor(0.05 * (sorted.length - 1))];
-    const maxVal = sorted[Math.floor(0.95 * (sorted.length - 1))];
-    const filteredCurve = {};
-    Object.keys(rawData.seasonalCurveByYear).forEach(year => {
-      filteredCurve[year] = (rawData.seasonalCurveByYear[year] || []).map((v) =>
-        Number.isFinite(v) ? Math.min(Math.max(v, minVal), maxVal) : v
-      );
-    });
-
-    setData({
-      ...rawData,
-      seasonalCurveByYear: filteredCurve
-    });
-  } else {
-    setData(rawData); // ripristina dati originali
-  }
-}, [excludeOutliers, rawData]);
+// Outlier filtering is performed by the backend.
 
 
 
@@ -172,7 +159,7 @@ useEffect(() => {
     if (!benchmarkTicker) return;
 
     const fetchBenchmark = async () => {
-      const key = `${benchmarkTicker}|${excludeOutliers}`;
+      const key = `${benchmarkTicker}|${excludeOutliers}|${priorYearsOnly}`;
       const cached = seasonCacheRef.current.get(key);
       if (cached && Date.now() - cached.ts < 5 * 60_000) {
         setBenchmarkData(cached.data);
@@ -185,7 +172,7 @@ useEffect(() => {
 
       try {
         const res = await fetch(
-  apiUrl(`/seasonality/${benchmarkTicker}?exclude_outliers=${excludeOutliers}`),
+  apiUrl(`/seasonality/${encodeURIComponent(benchmarkTicker)}?exclude_outliers=${excludeOutliers}&prior_years_only=${priorYearsOnly}`),
   { signal: controller.signal }
 );
 
@@ -200,7 +187,7 @@ useEffect(() => {
       }
     };
     fetchBenchmark();
-  }, [benchmarkTicker, excludeOutliers]);
+  }, [benchmarkTicker, excludeOutliers, priorYearsOnly]);
 
   /* ============================= RANGE SLIDER ============================= */
   const handleThumbDrag = (type, e) => {
@@ -268,7 +255,20 @@ useEffect(() => {
         </div>
       </div>
     );
-  if (error) return <div className="status error status--stagionalita">{error}</div>;
+  if (error) {
+    return (
+      <div className={`stagionalita-page ${darkMode ? "dark" : "light"}`}>
+        <div className="seasonality-error-card">
+          <FiCalendar aria-hidden="true" />
+          <h2>Analisi non disponibile</h2>
+          <p>{error}</p>
+          <button type="button" onClick={() => navigate(`/search?query=${ticker}`)}>
+            Torna alla ricerca
+          </button>
+        </div>
+      </div>
+    );
+  }
   if (!data) return null;
 
 
@@ -441,15 +441,6 @@ const winRateMean = totalValidMonths > 0
   ? (totalWins / totalValidMonths) * 100 
   : null;
 
-// -----------------------------
-// Output
-// -----------------------------
-console.log({ monthStats, bestMonth, worstMonth, winRateMean });
-
-
-
-
-
   /* ============================= PLOT TRACES ============================= */
   const traces = selectedYears.map((year) => ({
     x: data.months,
@@ -532,6 +523,26 @@ console.log({ monthStats, bestMonth, worstMonth, winRateMean });
   addDragListeners(move, stop);
 };
 
+  const plotSurface = darkMode ? "#101b2a" : "#ffffff";
+  const plotText = darkMode ? "#dbe7f4" : "#344054";
+  const plotGrid = darkMode ? "rgba(158, 177, 203, 0.14)" : "#e8ebf0";
+  const sharedPlotLayout = {
+    paper_bgcolor: plotSurface,
+    plot_bgcolor: plotSurface,
+    font: { color: plotText, family: "Inter, system-ui, sans-serif", size: 12 },
+    xaxis: { gridcolor: plotGrid, zerolinecolor: plotGrid },
+    margin: { t: 24, l: 55, r: 22, b: 44 },
+    hoverlabel: {
+      bgcolor: darkMode ? "#142234" : "#ffffff",
+      bordercolor: darkMode ? "#314158" : "#d8dee8",
+      font: { color: plotText },
+    },
+  };
+  const plotConfig = {
+    responsive: true,
+    displayModeBar: true,
+    displaylogo: false,
+  };
 
 
   return (
@@ -539,37 +550,57 @@ console.log({ monthStats, bestMonth, worstMonth, winRateMean });
       <div className="analysis-card season-card">
 
   {/* TOP ACTIONS */}
-  <div className="top-box season-card">
-    <div
-      className="ticker-card-modern season-card"
+  <div className="info-cards info-cards--top seasonality-nav-cards">
+    <button
+      type="button"
+      className="info-card search-card"
       onClick={() => navigate(`/search?query=${ticker}`)}
     >
-      <FiSearch className="ticker-card-icon" />
-      <div className="ticker-card-symbol">{ticker}</div>
-      <div className="ticker-card-text">Cerca</div>
-    </div>
+      <div className="icon"><FiSearch /></div>
+      <div className="card-title">Cerca</div>
+    </button>
 
-    <div
-      className="ticker-card-modern season-card"
-      onClick={() => navigate(`/Previsione?ticker=${ticker}`)}
-    >
-      <FiBarChart2 className="ticker-card-icon" />
-      <div className="ticker-card-symbol">{ticker}</div>
-      <div className="ticker-card-text">Previsioni</div>
-    </div>
-
-    <div
-      className="ticker-card-modern season-card"
+    <button
+      type="button"
+      className="info-card search-card"
       onClick={() => navigate(`/technicals?ticker=${ticker}`)}
     >
-      <FiTrendingUp className="ticker-card-icon" />
-      <div className="ticker-card-symbol">{ticker}</div>
-      <div className="ticker-card-text">Tecnici</div>
-    </div>
+      <div className="icon"><FiTrendingUp /></div>
+      <div className="card-title">Tecnici</div>
+    </button>
+
+    <button
+      type="button"
+      className="info-card search-card"
+      onClick={() => navigate(`/Previsione?ticker=${ticker}`)}
+    >
+      <div className="icon"><FiClock /></div>
+      <div className="card-title">Previsioni</div>
+    </button>
+
+    <button
+      type="button"
+      className="info-card search-card"
+      onClick={() => navigate(`/bilancio?ticker=${ticker}`)}
+    >
+      <div className="icon"><FiBookOpen /></div>
+      <div className="card-title">Bilancio</div>
+    </button>
+
+    <button
+      type="button"
+      className="info-card search-card"
+      onClick={() => navigate(`/quantitativi?ticker=${ticker}`)}
+    >
+      <div className="icon"><FiBarChart2 /></div>
+      <div className="card-title">Quantitativi</div>
+    </button>
   </div>
 
 
   <h1 className="page-title">Stagionalità – {ticker}</h1>
+  <p>Ultima chiusura disponibile: {data.asOf || "—"}. {priorYearsOnly ? "Anni precedenti, senza anno corrente." : "La vista standard include anche l’anno corrente parziale."}</p>
+  {data.excludeOutliers && <p>Outlier ridotti con il motore condiviso: {data.outlierAudit?.limited ?? "—"} rendimenti mensili limitati ai percentili 5/95; nessun mese eliminato.</p>}
 
     <div className="seasonality-kpi-row">
   <div className="seasonality-kpi trade-month buy season-card">
@@ -659,7 +690,7 @@ console.log({ monthStats, bestMonth, worstMonth, winRateMean });
   className={`outlier-toggle ${excludeOutliers ? "active" : ""}`}
   onClick={() => setExcludeOutliers(o => !o)}
 >
-  {excludeOutliers ? "winsorizzazione" : "winsorizzazione"}
+  {excludeOutliers ? "Outlier ridotti" : "Riduci outlier"}
 </button>
 
 
@@ -670,15 +701,16 @@ console.log({ monthStats, bestMonth, worstMonth, winRateMean });
         <input
           type="text"
           placeholder="Inserisci ticker benchmark"
-          value={benchmarkTicker}
+          value={benchmarkInput}
           onChange={(e) =>
-            setBenchmarkTicker(e.target.value.toUpperCase())
+            setBenchmarkInput(e.target.value.toUpperCase())
           }
           className="benchmark-input"
         />
         <button
           className="benchmark-submit"
-          onClick={() => setBenchmarkTicker(benchmarkTicker)}
+          onClick={() => setBenchmarkTicker(benchmarkInput.trim())}
+          disabled={!benchmarkInput.trim()}
         >
           Confronta
         </button>
@@ -691,14 +723,17 @@ console.log({ monthStats, bestMonth, worstMonth, winRateMean });
           <Plot
             data={traces}
             layout={{
-              paper_bgcolor: darkMode ? "#121212" : "#ffffff",
-              plot_bgcolor: darkMode ? "#121212" : "#ffffff",
-              font: { color: darkMode ? "#ffffff" : "#000000" },
-              yaxis: { title: "Variazione %", ticksuffix: "%", zeroline: true },
-              margin: { t: 20, l: 55, r: 20, b: 40 },
+              ...sharedPlotLayout,
+              yaxis: {
+                title: "Variazione %",
+                ticksuffix: "%",
+                zeroline: true,
+                gridcolor: plotGrid,
+                zerolinecolor: plotGrid,
+              },
               legend: { orientation: "h", x: 0, y: 1.1 }
             }}
-            config={{ responsive: true, displayModeBar: true }}
+            config={plotConfig}
             style={{ width: "100%", height: "420px" }}
           />
           
@@ -749,19 +784,21 @@ console.log({ monthStats, bestMonth, worstMonth, winRateMean });
         {viewMode === "percentile" && (
           <Plot
             data={[
-              { x: data.months, y: monthlyPercentiles.map(p => p.p10), type: "bar", name: "10° Percentile", marker: { color: "#ff4d4f" } },
-              { x: data.months, y: monthlyPercentiles.map(p => p.median), type: "bar", name: "Mediana", marker: { color: "#1890ff" } },
-              { x: data.months, y: monthlyPercentiles.map(p => p.p90), type: "bar", name: "90° Percentile", marker: { color: "#52c41a" } }
+              { x: data.months, y: monthlyPercentiles.map(p => p.p10), type: "bar", name: "10° Percentile", marker: { color: "#ef6a6a" } },
+              { x: data.months, y: monthlyPercentiles.map(p => p.median), type: "bar", name: "Mediana", marker: { color: "#2bd3b1" } },
+              { x: data.months, y: monthlyPercentiles.map(p => p.p90), type: "bar", name: "90° Percentile", marker: { color: "#4c8dff" } }
             ]}
             layout={{
+              ...sharedPlotLayout,
               barmode: "group",
-              paper_bgcolor: darkMode ? "#121212" : "#ffffff",
-              plot_bgcolor: darkMode ? "#121212" : "#ffffff",
-              font: { color: darkMode ? "#ffffff" : "#000000" },
-              yaxis: { title: "Variazione %" },
-              margin: { t: 20, l: 55, r: 20, b: 40 }
+              yaxis: {
+                title: "Variazione %",
+                ticksuffix: "%",
+                gridcolor: plotGrid,
+                zerolinecolor: plotGrid,
+              },
             }}
-            config={{ responsive: true, displayModeBar: true }}
+            config={plotConfig}
             style={{ width: "100%", height: "420px" }}
           />
         )}
@@ -774,32 +811,34 @@ console.log({ monthStats, bestMonth, worstMonth, winRateMean });
         y: cumulativePercentiles.map(p => p.p10), 
         type: "bar", 
         name: "10° Percentile (Cumulativo)", 
-        marker: { color: "#ff4d4f" } 
+        marker: { color: "#ef6a6a" }
       },
       { 
         x: data.months, 
         y: cumulativePercentiles.map(p => p.median), 
         type: "bar", 
         name: "Mediana (Cumulativo)", 
-        marker: { color: "#1890ff" } 
+        marker: { color: "#2bd3b1" }
       },
       { 
         x: data.months, 
         y: cumulativePercentiles.map(p => p.p90), 
         type: "bar", 
         name: "90° Percentile (Cumulativo)", 
-        marker: { color: "#52c41a" } 
+        marker: { color: "#4c8dff" }
       }
     ]}
     layout={{
+      ...sharedPlotLayout,
       barmode: "group",
-      paper_bgcolor: darkMode ? "#121212" : "#ffffff",
-      plot_bgcolor: darkMode ? "#121212" : "#ffffff",
-      font: { color: darkMode ? "#ffffff" : "#000000" },
-      yaxis: { title: "Variazione % cumulativa" },
-      margin: { t: 20, l: 55, r: 20, b: 40 }
+      yaxis: {
+        title: "Variazione % cumulativa",
+        ticksuffix: "%",
+        gridcolor: plotGrid,
+        zerolinecolor: plotGrid,
+      },
     }}
-    config={{ responsive: true, displayModeBar: true }}
+    config={plotConfig}
     style={{ width: "100%", height: "420px" }}
   />
 )}

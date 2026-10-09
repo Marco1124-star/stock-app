@@ -1,0 +1,111 @@
+/* Dedicated phone presentation. Keep the analytical data and desktop layout intact. */
+.previsione-mobile-hero, .previsione-mobile-chart-title { display: none; }
+
+@media screen and (max-width: 640px) {
+  .app-content .supply-demand-page { padding-inline: 12px; padding-top: 12px; }
+  .supply-demand-page .supply-demand-main { gap: 14px; min-width: 0; }
+  .supply-demand-page :is(#structure-neural-title, #previsione-signals, #previsione-levels, #previsione-charts, #previsione-gaps) { scroll-margin-top: 16px; }
+  .app-content .supply-demand-page .previsione-nav-cards { margin-bottom: 0; padding-bottom: 8px; }
+  .supply-demand-page .previsione-mobile-hero {
+    display: grid; gap: 14px; padding: 6px 2px 4px; color: var(--prev-text);
+  }
+  .previsione-mobile-hero-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .previsione-mobile-eyebrow { display: block; color: var(--prev-green); font-size: .66rem; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+  .previsione-mobile-hero h1 { margin: 4px 0 0; font-size: 1.75rem; font-weight: 800; letter-spacing: -.045em; line-height: 1.15; }
+  .previsione-mobile-symbol { padding: 7px 10px; max-width: 45%; overflow-wrap: anywhere; border: 1px solid var(--prev-border); border-radius: 12px; color: var(--prev-green); background: var(--prev-green-soft); font-size: .8rem; font-weight: 800; }
+  .previsione-mobile-quote { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; }
+  .previsione-mobile-quote span { color: var(--prev-muted); font-size: .76rem; }
+  .previsione-mobile-quote strong { font-size: 1.2rem; font-variant-numeric: tabular-nums; }
+  .previsione-mobile-sections { display: flex; gap: 6px; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: thin; padding-bottom: 3px; }
+  .previsione-mobile-sections a { flex: 0 0 auto; display: inline-flex; align-items: center; min-height: 44px; padding: 0 13px; border: 1px solid var(--prev-border); border-radius: 999px; color: var(--prev-text); background: var(--prev-surface); font-size: .75rem; font-weight: 700; text-decoration: none; }
+  .previsione-mobile-sections a:focus-visible { outline: 2px solid var(--prev-green); outline-offset: -3px; }
+
+  /* Model first: tighter typography, one clear action, no hidden warnings. */
+  .supply-demand-page .structure-neural { padding: 16px; border-radius: 20px; box-shadow: 0 6px 20px rgba(0,0,0,.07); }
+  .supply-demand-page .structure-neural__header { gap: 9px; }
+  .supply-demand-page .structure-neural__heading { display: grid; grid-template-columns: 32px minmax(0, 1fr); gap: 10px; width: 100%; }
+  .supply-demand-page .structure-neural__icon { width: 32px; height: 32px; font-size: 19px; border-radius: 10px; }
+  .supply-demand-page .structure-neural__eyebrow { font-size: .62rem; letter-spacing: .035em; }
+  .supply-demand-page .structure-neural h2 { font-size: 1.1rem; line-height: 1.3; letter-spacing: -.02em; }
+  .supply-demand-page .structure-neural__ticker { margin-left: 42px; padding: 4px 8px; font-size: .67rem; border-radius: 999px; }
+  .supply-demand-page .structure-neural p { font-size: .78rem; line-height: 1.55; margin: 10px 0; }
+  .supply-demand-page .structure-neural__controls { display: grid; grid-template-columns: minmax(0, 1fr); gap: 9px; padding: 10px 0; }
+  .supply-demand-page .structure-neural__controls label { gap: 5px; font-size: .72rem; }
+  .supply-demand-page .structure-neural__run { min-height: 48px; border-radius: 13px; }
+  .supply-demand-page .structure-neural__panel { padding: 13px; border-radius: 14px; }
+  .supply-demand-page .structure-neural__headline { font-size: 1.25rem; margin: 12px 0; }
+  .supply-demand-page .structure-neural__probabilities { gap: 5px; }
+  .supply-demand-page .structure-neural__probabilities > div { min-width: 0; }
+  .supply-demand-page .structure-neural__probabilities span { font-size: .7rem; }
+  .supply-demand-page .structure-neural__details { margin-top: 12px; font-size: .76rem; }
+
+  /* Rule-based signals remain separate from the model's validated probabilities. */
+  .supply-demand-page .overview-strip-card { padding: 16px; border-radius: 20px; }
+  .supply-demand-page .overview-strip-card > p { color: var(--prev-muted); font-size: .72rem; line-height: 1.5; margin: 0 0 12px; }
+  .supply-demand-page .overview-strip-head { display: flex; flex-direction: row; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; padding-bottom: 12px; }
+  .supply-demand-page .overview-strip-symbol { font-size: 1.3rem; }
+  .supply-demand-page .overview-signal-badge--hero { min-width: 0; padding: 8px 11px; font-size: .9rem; border-radius: 12px; }
+  .supply-demand-page :is(.timeframe-selector, .tech-timeframe-selector) { display: flex; flex-wrap: nowrap; width: 100%; min-width: 0; gap: 4px; padding: 4px; border-radius: 12px; background: var(--prev-surface-2); }
+  .supply-demand-page :is(.timeframe-selector, .tech-timeframe-selector) button { flex: 1 1 0; min-width: 0; min-height: 44px; padding: 8px 5px; font-size: .75rem; border-radius: 9px; }
+  .supply-demand-page :is(.timeframe-selector, .tech-timeframe-selector) button.active { background: var(--prev-green); border-color: var(--prev-green); color: #08121f; box-shadow: none; }
+  .supply-demand-page:is(.light, .dark) :is(.timeframe-selector, .tech-timeframe-selector, .chart-type-selector) button.active { background: var(--prev-green); border-color: var(--prev-green); color: #08121f; box-shadow: none; }
+  .supply-demand-page.light :is(.timeframe-selector, .tech-timeframe-selector, .chart-type-selector) button.active { color: white; }
+  .supply-demand-page .overview-horizon-grid { grid-template-columns: minmax(0, 1fr); gap: 8px; margin-top: 12px; }
+  .supply-demand-page .overview-horizon-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 6px 10px; padding: 12px; border-radius: 13px; min-width: 0; }
+  .supply-demand-page .overview-horizon-head { flex-wrap: wrap; gap: 4px; }
+  .supply-demand-page .overview-horizon-ref { font-size: .65rem; }
+  .supply-demand-page .overview-horizon-badge { font-size: .68rem; padding: 5px 8px; max-width: 145px; white-space: normal; }
+  .supply-demand-page .overview-horizon-main { font-size: .72rem; }
+  .supply-demand-page .overview-horizon-levels { display: flex; flex-wrap: wrap; gap: 4px 8px; font-size: .67rem; }
+  .supply-demand-page .overview-strip-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .supply-demand-page .overview-metric { min-width: 0; padding: 11px; border-radius: 12px; }
+  .supply-demand-page .overview-label-with-tip { display: flex; justify-content: space-between; gap: 3px; font-size: .64rem; letter-spacing: .025em; }
+  .supply-demand-page .overview-help-tip { flex: 0 0 44px; width: 44px; height: 44px; min-width: 44px; font-size: .8rem; }
+  .supply-demand-page .overview-metric :is(strong, .overview-value) { overflow-wrap: anywhere; font-size: 1.05rem; }
+  .supply-demand-page .overview-signal-breakdown { gap: 6px; }
+  .supply-demand-page .overview-breakdown-item { min-width: 0; padding: 9px; font-size: .72rem; }
+  .supply-demand-page .overview-strategy-plan { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .supply-demand-page .overview-plan-item { padding: 11px; border-radius: 12px; min-width: 0; }
+  .supply-demand-page .overview-plan-empty { grid-column: 1 / -1; font-size: .76rem; }
+
+  /* Levels, seasonality and technical context use the same mobile card language. */
+  .supply-demand-page .cards-row { gap: 14px; margin-top: 0; justify-items: stretch; }
+  .supply-demand-page :is(.action-panel, .supply-demand-card) { width: 100%; min-width: 0; padding: 16px; border-radius: 20px; min-height: 0; }
+  .supply-demand-page .supply-demand-card { order: -1; }
+  .supply-demand-page .info-card-container { display: block; }
+  .supply-demand-page .left-card { padding: 0; border: 0; background: transparent; box-shadow: none; width: 100%; }
+  .supply-demand-page .left-card h2 { font-size: 1.05rem; text-align: left; }
+  .supply-demand-page .left-card .levels { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .supply-demand-page .levels-col { min-width: 0; padding: 10px; border: 1px solid var(--prev-border); border-radius: 12px; background: var(--prev-surface-2); }
+  .supply-demand-page .level-row { gap: 6px; font-size: .76rem; flex-wrap: wrap; }
+  .supply-demand-page .advanced-grid { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .supply-demand-page .advanced-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+  .supply-demand-page .advanced-actions button { flex: 1; }
+  .supply-demand-page .panel-title { font-size: 1.05rem; padding-bottom: 12px; margin-bottom: 12px; }
+  .supply-demand-page .seasonality-kpi-row { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .supply-demand-page .seasonality-current { padding: 12px; }
+  .supply-demand-page .tech-main { font-size: 1.3rem; }
+
+  /* Charts get the full card width; dense gap data wraps instead of shrinking. */
+  .supply-demand-page .chart-card { border: 0; background: transparent; box-shadow: none; }
+  .supply-demand-page .supply-chart-panel { padding: 14px 10px; border-radius: 20px; margin-bottom: 14px; }
+  .supply-demand-page .previsione-mobile-chart-title { display: block; color: var(--prev-text); font-size: 1.05rem; margin: 2px 4px 12px; }
+  .supply-demand-page .chart-controls { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; padding-bottom: 12px; }
+  .supply-demand-page .chart-type-selector { display: flex; width: 100%; gap: 6px; }
+  .supply-demand-page .chart-type-selector button { flex: 1; min-height: 44px; }
+  .supply-demand-page .gap-panel-header { align-items: flex-start; flex-direction: column; gap: 5px; margin-inline: 4px; }
+  .supply-demand-page .gap-panel-header h3 { font-size: 1.05rem; margin: 0; }
+  .supply-demand-page .gap-panel-subtitle { font-size: .7rem; line-height: 1.5; }
+  .supply-demand-page :is(.gap-kpi-grid, .gap-prob-row) { gap: 8px; }
+  .supply-demand-page :is(.gap-kpi, .gap-prob-item) { min-width: 0; padding: 10px; border-radius: 12px; }
+  .supply-demand-page .gap-kpi span { font-size: .67rem; line-height: 1.4; }
+  .supply-demand-page .gap-kpi strong { font-size: 1.15rem; }
+  .supply-demand-page .gap-open-item { grid-template-columns: minmax(0, 1fr) auto; gap: 5px; padding: 10px; border-radius: 10px; }
+  .supply-demand-page .gap-open-item-range { grid-column: 1 / -1; text-align: left; font-variant-numeric: tabular-nums; }
+  .supply-demand-page .gap-chart-toolbar { gap: 8px; margin-top: 14px; }
+  .supply-demand-page .gap-chart-hint { font-size: .68rem; line-height: 1.5; }
+  .supply-demand-page .gap-chart-wrap { height: 300px; min-width: 0; }
+  .supply-demand-page .seasonality-mini-chart { margin-top: 14px; padding: 12px 4px; border-radius: 14px; }
+  .supply-demand-page .seasonality-mini-chart-title { padding-inline: 6px; font-size: .76rem; line-height: 1.5; }
+  .supply-demand-page .seasonality-mini-chart-wrap { height: 280px; }
+}

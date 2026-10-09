@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useMemo, useRef } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import "./TechnicalsPage.css";
-import { FiSearch, FiTrendingUp, FiCalendar } from "react-icons/fi";
+import { FiSearch, FiTrendingUp, FiCalendar, FiBookOpen, FiBarChart2 } from "react-icons/fi";
 import Plot from "react-plotly.js";
 import { API_BASE_URL } from "../services/apiBase";
 
@@ -54,6 +54,7 @@ export default function TechnicalsPage({ darkMode }) {
     if (cached && Date.now() - cached.ts < 90_000) {
       const json = cached.data;
       setData(json);
+      if (json.summary) setSummary(json.summary);
       setError(null);
       setLoadingTechnicals(false);
       return;
@@ -126,7 +127,7 @@ export default function TechnicalsPage({ darkMode }) {
             ? "Sell"
             : "Neutral";
 
-        setSummary({
+        setSummary(json.summary || {
           general,
           oscillators,
           movingAverages,
@@ -302,6 +303,24 @@ export default function TechnicalsPage({ darkMode }) {
   return (
     <div className={`technicals-page ${darkMode ? "dark" : "light"}`}>
       {/* 🔷 TOP BOX CON CARDS MODERNE */}
+      <div className="info-cards info-cards--top technicals-nav-cards" aria-label="Sezioni del titolo">
+        <div className="info-card search-card" onClick={() => navigate(`/search?query=${encodeURIComponent(ticker)}`)} role="button" tabIndex={0}>
+          <div className="icon"><FiSearch /></div><div className="card-title">Cerca</div>
+        </div>
+        <div className="info-card search-card" onClick={() => navigate(`/Previsione?ticker=${encodeURIComponent(ticker)}`)} role="button" tabIndex={0}>
+          <div className="icon"><FiTrendingUp /></div><div className="card-title">Previsioni</div>
+        </div>
+        <div className="info-card search-card" onClick={() => navigate(`/Stagionalita?ticker=${encodeURIComponent(ticker)}`)} role="button" tabIndex={0}>
+          <div className="icon"><FiCalendar /></div><div className="card-title">Stagionalita</div>
+        </div>
+        <div className="info-card search-card" onClick={() => navigate(`/bilancio?ticker=${encodeURIComponent(ticker)}`)} role="button" tabIndex={0}>
+          <div className="icon"><FiBookOpen /></div><div className="card-title">Bilancio</div>
+        </div>
+        <div className="info-card search-card" onClick={() => navigate(`/quantitativi?ticker=${encodeURIComponent(ticker)}`)} role="button" tabIndex={0}>
+          <div className="icon"><FiBarChart2 /></div><div className="card-title">Quantitativi</div>
+        </div>
+      </div>
+
       <div className="top-box tech-card">
         <div
           className="ticker-card-modern tech-card"
@@ -314,6 +333,7 @@ export default function TechnicalsPage({ darkMode }) {
 
         <div className="top-box-main" style={{ flex: 1, textAlign: "center" }}>
           <h1 className="tech-title">Analisi Tecnica — {ticker}</h1>
+          {data.completedDaily && <p>Ultima chiusura completata: {data.asOf?.slice(0, 10) || "—"}.</p>}
 
           <div className="timeframe-selector">
             {TIMEFRAMES.map((tf) => (
@@ -404,6 +424,7 @@ export default function TechnicalsPage({ darkMode }) {
               </div>
             </div>
 
+            <div className="technical-table-scroll" role="region" aria-label="Indicatori tecnici" tabIndex={0}>
             <table>
               <thead>
                 <tr>
@@ -422,6 +443,7 @@ export default function TechnicalsPage({ darkMode }) {
                 ))}
               </tbody>
             </table>
+            </div>
           </div>
         ))}
       </div>

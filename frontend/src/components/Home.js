@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Doughnut, Line } from "react-chartjs-2";
+import { Doughnut, Line, Scatter } from "react-chartjs-2";
 import {
   ArcElement,
   CategoryScale,
@@ -13,11 +13,26 @@ import {
   Tooltip,
 } from "chart.js";
 import {
+  FiActivity,
+  FiArrowUpRight,
+  FiBarChart2,
+  FiBriefcase,
+  FiCheckCircle,
+  FiEye,
+  FiSearch,
+  FiShield,
+  FiTrendingUp,
+  FiUsers,
+  FiX,
+} from "react-icons/fi";
+import {
   computePortfolioTradingSignal,
   TRADING_SIGNAL_VERSION,
 } from "../utils/tradingSignal";
 import { fetchSavedSocialPortfolios, syncSocialPortfolios } from "../services/api";
 import { apiUrl } from "../services/apiBase";
+import { buildRiskSelection } from "../utils/portfolioRisk";
+import usePersistentPortfolio from "../utils/usePersistentPortfolio";
 import "./Home.css";
 const PORTFOLIO_STORAGE_PREFIX = "portfolio-tickers:v1:";
 const HOME_SNAPSHOT_PREFIX = "home-snapshot:v1:";
@@ -27,15 +42,17 @@ const SOCIAL_SYNC_DEBOUNCE_MS = 1200;
 const SAVED_SOCIAL_REFRESH_MS = 45 * 1000;
 const DEFAULT_PORTFOLIO_ID = "portfolio-1";
 const MAX_PORTFOLIO_NAME_LEN = 40;
+const MAX_RISK_PORTFOLIO_TICKERS = 50000;
+const RISK_FETCH_CONCURRENCY = 12;
 const CHART_COLORS = [
-  "#4e5dcc",
-  "#16a34a",
+  "#20bd9d",
+  "#3b82f6",
   "#f59e0b",
-  "#dc2626",
-  "#0891b2",
-  "#7c3aed",
-  "#475569",
-  "#be123c",
+  "#ef4444",
+  "#06b6d4",
+  "#84cc16",
+  "#64748b",
+  "#f97316",
 ];
 const WATCHLIST_SIGNAL_TIMEFRAME_OPTIONS = [
   { value: "1d", label: "1D" },
@@ -67,6 +84,33 @@ ChartJS.register(
 
 const normalizeTicker = (value) =>
   (value || "").trim().toUpperCase().replace(/\s+/g, "");
+
+const normalizeIsin = (value) => String(value || "").trim().toUpperCase().replace(/\s+/g, "");
+const isValidIsin = (value) => {
+  const isin = normalizeIsin(value);
+  if (!/^[A-Z]{2}[A-Z0-9]{9}[0-9]$/.test(isin)) return false;
+  const expanded = isin.split("").flatMap((character) => {
+    if (/\d/.test(character)) return [Number(character)];
+    return String(character.charCodeAt(0) - 55).split("").map(Number);
+  });
+  // Luhn weights are applied from the right. The expanded length varies
+  // with the number of letters in the NSIN, so indexing from the left is
+  // not correct for every valid ISIN (for example IE00B4L5Y983).
+  const sum = expanded.reduce((total, digit, index) => {
+    const distanceFromRight = expanded.length - 1 - index;
+    const weighted = digit * (distanceFromRight % 2 === 1 ? 2 : 1);
+    return total + Math.floor(weighted / 10) + (weighted % 10);
+  }, 0);
+  return sum % 10 === 0;
+};
+
+const findIsinInText = (value) => {
+  const text = String(value || "").toUpperCase();
+  const compactValue = normalizeIsin(text);
+  if (isValidIsin(compactValue)) return compactValue;
+  const matches = text.match(/[A-Z]{2}[A-Z0-9]{9}[0-9]/g) || [];
+  return matches.map(normalizeIsin).find(isValidIsin) || "";
+};
 
 const uniqueTickers = (list) =>
   (Array.isArray(list) ? list : [])
@@ -464,6 +508,10 @@ const Home = ({
     () => `${HOME_SNAPSHOT_PREFIX}${storageScope}`,
     [storageScope]
   );
+  const riskPortfolioStorageKey = useMemo(
+    () => `${PORTFOLIO_STORAGE_PREFIX}risk:${storageScope}`,
+    [storageScope]
+  );
 
   const [showAddBox, setShowAddBox] = useState(false);
   const [searchInput, setSearchInput] = useState("");
@@ -474,8 +522,8 @@ const Home = ({
   const [dragOverTicker, setDragOverTicker] = useState(null);
 
   const [portfolioInput, setPortfolioInput] = useState("");
-  const [portfolioCollection, setPortfolioCollection] = useState(() =>
-    createDefaultPortfolioCollection()
+  const [portfolioCollection, setPortfolioCollection, portfolioStorageError] = usePersistentPortfolio(
+    portfolioStorageKey, normalizePortfolioCollection
   );
   const [showCreatePortfolioCard, setShowCreatePortfolioCard] = useState(false);
   const [newPortfolioVisibility, setNewPortfolioVisibility] = useState("private");
@@ -491,6 +539,14 @@ const Home = ({
   const [savedSocialLoading, setSavedSocialLoading] = useState(false);
   const [savedSocialError, setSavedSocialError] = useState("");
   const [homeSnapshotReady, setHomeSnapshotReady] = useState(false);
+  const [riskPortfolioInput, setRiskPortfolioInput] = useState("");
+  const [riskPortfolioTickers, setRiskPortfolioTickers] = useState([]);
+  const [riskPortfolioResult, setRiskPortfolioResult] = useState(null);
+  const [riskPortfolioLoading, setRiskPortfolioLoading] = useState(false);
+  const [riskPortfolioError, setRiskPortfolioError] = useState("");
+  const [riskPortfolioProgress, setRiskPortfolioProgress] = useState({ completed: 0, total: 0 });
+  const [riskPortfolioResolving, setRiskPortfolioResolving] = useState(false);
+  const [riskPortfolioConversions, setRiskPortfolioConversions] = useState([]);
 
   const activePortfolioId = useMemo(
     () => resolveActivePortfolioId(portfolioCollection),
@@ -527,10 +583,10 @@ const Home = ({
 
   const suppressClickRef = useRef(false);
   const portfolioSignalCacheRef = useRef(new Map());
-  const portfolioStorageSyncRef = useRef(true);
   const watchlistPriceFetchInFlightRef = useRef(false);
   const watchlistSignalFetchInFlightRef = useRef(false);
   const portfolioQuoteFetchInFlightRef = useRef(false);
+  const riskPortfolioStorageSyncRef = useRef(true);
   const socialSyncSignatureRef = useRef("");
   const clearSignalCacheForTicker = useCallback((ticker) => {
     const normalized = normalizeTicker(ticker);
@@ -569,7 +625,7 @@ const Home = ({
         items: nextItems,
       };
     });
-  }, []);
+  }, [setPortfolioCollection]);
 
   useEffect(() => {
     setHomeSnapshotReady(false);
@@ -753,24 +809,23 @@ const Home = ({
   }, [normalizedWatchlist]);
 
   useEffect(() => {
-    portfolioStorageSyncRef.current = true;
-    const stored = normalizePortfolioCollection(readJsonFromStorage(portfolioStorageKey));
-    setPortfolioCollection(stored);
-    setPortfolioError("");
-  }, [portfolioStorageKey]);
+    riskPortfolioStorageSyncRef.current = true;
+    const stored = readJsonFromStorage(riskPortfolioStorageKey);
+    setRiskPortfolioTickers(Array.isArray(stored) ? uniqueTickers(stored).slice(0, MAX_RISK_PORTFOLIO_TICKERS) : []);
+    setRiskPortfolioResult(null);
+  }, [riskPortfolioStorageKey]);
 
   useEffect(() => {
-    if (portfolioStorageSyncRef.current) {
-      portfolioStorageSyncRef.current = false;
+    if (riskPortfolioStorageSyncRef.current) {
+      riskPortfolioStorageSyncRef.current = false;
       return;
     }
-
     try {
-      localStorage.setItem(portfolioStorageKey, JSON.stringify(portfolioCollection));
+      localStorage.setItem(riskPortfolioStorageKey, JSON.stringify(riskPortfolioTickers));
     } catch {
       // ignore storage errors
     }
-  }, [portfolioStorageKey, portfolioCollection]);
+  }, [riskPortfolioStorageKey, riskPortfolioTickers]);
 
   useEffect(() => {
     if (!homeSnapshotReady) return;
@@ -1320,7 +1375,7 @@ const Home = ({
         items: nextItems,
       };
     });
-  }, []);
+  }, [setPortfolioCollection]);
 
   const toggleActivePortfolioVisibility = useCallback(() => {
     if (!activePortfolioId) return;
@@ -1445,10 +1500,7 @@ const Home = ({
     try {
       const quote = await fetchPortfolioQuoteForTicker(ticker);
       if (!quote) {
-        updatePortfolioEntriesById(targetPortfolioId, (prevEntries) =>
-          prevEntries.filter((entry) => entry.id !== entryId)
-        );
-        setPortfolioError("Ticker non trovato.");
+        setPortfolioError("Titolo conservato nel portafoglio, ma quotazione non disponibile. Verifica il simbolo inserito.");
         return;
       }
 
@@ -1487,10 +1539,155 @@ const Home = ({
         return changed ? nextEntries : prevEntries;
       });
     } catch {
-      updatePortfolioEntriesById(targetPortfolioId, (prevEntries) =>
-        prevEntries.filter((entry) => entry.id !== entryId)
-      );
-      setPortfolioError("Errore durante l'aggiunta del ticker.");
+      setPortfolioError("Titolo conservato nel portafoglio. Quotazione temporaneamente non disponibile.");
+    }
+  };
+
+  const addRiskPortfolioTickers = async () => {
+    const rawInput = riskPortfolioInput.trim();
+    if (!rawInput) return;
+    const lines = rawInput.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+    const candidates = [];
+    lines.forEach((line) => {
+      if (/^[-|\s]+$/.test(line)) return;
+      const cells = line.split("|").map((value) => value.trim()).filter(Boolean);
+      const cleanCells = cells.filter((value) => !/^[-:]+$/.test(value));
+      if (!cleanCells.length) return;
+      const isin = cleanCells.map(findIsinInText).find(Boolean) || findIsinInText(line);
+      if (!isin && cleanCells.some((value) => /^(isin|ticker|symbol|simbolo|strumento|nome|name)$/i.test(normalizeTicker(value)))) return;
+      const explicitSymbol = cleanCells.slice(1).find((value) => {
+        const normalized = normalizeTicker(value);
+        return !/^(isin|ticker|symbol|simbolo|strumento|nome|name)$/i.test(normalized)
+          && !isValidIsin(normalized)
+          && /^[A-Z0-9.-]{1,8}$/.test(normalized);
+      });
+      if (explicitSymbol) {
+        candidates.push({
+          raw: cleanCells[0] || explicitSymbol,
+          explicitSymbol: normalizeTicker(explicitSymbol),
+          isin,
+        });
+        return;
+      }
+      if (cleanCells.length > 1 && isin) {
+        const rawName = cleanCells.find((value) => !findIsinInText(value)) || isin;
+        candidates.push({ raw: rawName, isin });
+        return;
+      }
+      const values = cleanCells.length > 1
+        ? cleanCells
+        : line.split(/[,;]+/).map((value) => value.trim()).filter(Boolean);
+      values.forEach((value) => {
+        const valueIsin = findIsinInText(value) || isin;
+        if (valueIsin) {
+          const rawName = value.replace(valueIsin, "").replace(/[|,;]+/g, " ").trim() || valueIsin;
+          candidates.push({ raw: rawName, isin: valueIsin });
+          return;
+        }
+        const tokens = value.split(/\s+/);
+        if (!rawInput.includes("\n") && values.length === 1 && tokens.length > 1 && tokens.every((token) => token === token.toUpperCase() && /^[A-Z0-9.-]{1,8}$/.test(token))) {
+          tokens.forEach((token) => candidates.push({ raw: token }));
+        } else if (value) {
+          candidates.push({ raw: value });
+        }
+      });
+    });
+    setRiskPortfolioResolving(true);
+    setRiskPortfolioError("");
+    const conversions = [];
+    const resolved = [];
+    try {
+      for (let offset = 0; offset < candidates.length; offset += RISK_FETCH_CONCURRENCY) {
+        const batch = candidates.slice(offset, offset + RISK_FETCH_CONCURRENCY);
+        const batchResults = await Promise.all(batch.map(async (candidate) => {
+          const raw = candidate.raw.trim();
+          const normalized = normalizeTicker(candidate.explicitSymbol || raw);
+          if (candidate.explicitSymbol) return { raw, symbol: normalized, isin: candidate.isin };
+          const resolveSuggestion = async (query) => {
+            if (!query) return null;
+            try {
+              const response = await fetch(apiUrl(`/search/suggestions?q=${encodeURIComponent(query)}&limit=1`));
+              if (!response.ok) return null;
+              const payload = await response.json();
+              return payload?.suggestions?.[0] || null;
+            } catch {
+              return null;
+            }
+          };
+          if (candidate.isin) {
+            // ISIN is the strongest identifier. If the provider has no
+            // direct match, fall back to the accompanying issuer/fund name.
+            const suggestion = await resolveSuggestion(candidate.isin)
+              || (raw !== candidate.isin ? await resolveSuggestion(raw) : null);
+            const symbol = normalizeTicker(suggestion?.symbol);
+            return symbol ? { raw, symbol, isin: candidate.isin } : { raw, symbol: null, isin: candidate.isin };
+          }
+          const isCompactSymbol = !/[\s]/.test(raw) && /^[A-Z0-9.-]{1,4}$/i.test(raw);
+          if (isCompactSymbol) return { raw, symbol: normalized };
+          const suggestion = await resolveSuggestion(raw);
+          const symbol = normalizeTicker(suggestion?.symbol);
+          return symbol ? { raw, symbol } : { raw, symbol: null };
+        }));
+        batchResults.forEach((item) => {
+          if (!item.symbol) return;
+          resolved.push(item.symbol);
+          if (item.isin) conversions.push(`${item.isin} → ${item.symbol}`);
+          else if (item.raw.toUpperCase().replace(/\s+/g, "") !== item.symbol) conversions.push(`${item.raw} → ${item.symbol}`);
+        });
+      }
+      const next = uniqueTickers([...riskPortfolioTickers, ...resolved]).slice(0, MAX_RISK_PORTFOLIO_TICKERS);
+      setRiskPortfolioTickers(next);
+      setRiskPortfolioConversions(conversions.slice(0, 20));
+      if (!resolved.length) setRiskPortfolioError("Nessun ticker riconosciuto. Prova con un nome aziendale o un simbolo valido.");
+      setRiskPortfolioInput("");
+    } finally {
+      setRiskPortfolioResolving(false);
+    }
+  };
+
+  const removeRiskPortfolioTicker = (ticker) => {
+    setRiskPortfolioTickers((current) => current.filter((item) => item !== ticker));
+    setRiskPortfolioResult(null);
+  };
+
+  const analyzeRiskPortfolio = async () => {
+    if (riskPortfolioTickers.length < 2) {
+      setRiskPortfolioError("Inserisci almeno due titoli per analizzare la diversificazione.");
+      return;
+    }
+    setRiskPortfolioLoading(true);
+    setRiskPortfolioError("");
+    setRiskPortfolioProgress({ completed: 0, total: riskPortfolioTickers.length });
+    try {
+      const responses = [];
+      const skipped = [];
+      for (let offset = 0; offset < riskPortfolioTickers.length; offset += RISK_FETCH_CONCURRENCY) {
+        const batch = riskPortfolioTickers.slice(offset, offset + RISK_FETCH_CONCURRENCY);
+        const batchResults = await Promise.all(batch.map(async (ticker) => {
+          try {
+            const response = await fetch(apiUrl(`/stock/${encodeURIComponent(ticker)}/history?timeframe=1d&range=5y`));
+            const payload = await response.json();
+            if (!response.ok || !Array.isArray(payload?.history) || payload.history.length < 30) return { ticker, history: null };
+            return { ticker, history: payload.history };
+          } catch {
+            return { ticker, history: null };
+          }
+        }));
+        batchResults.forEach(({ ticker, history }) => {
+          if (history) responses.push([ticker, history]);
+          else skipped.push(ticker);
+        });
+        setRiskPortfolioProgress({ completed: Math.min(offset + batch.length, riskPortfolioTickers.length), total: riskPortfolioTickers.length });
+      }
+      if (responses.length < 2) throw new Error("Servono almeno due titoli con storico valido.");
+      const result = buildRiskSelection(Object.fromEntries(responses), { maxSelected: 25 });
+      if (!result) throw new Error("Non ci sono abbastanza dati storici comuni.");
+      setRiskPortfolioResult({ ...result, skippedTickers: skipped });
+    } catch (error) {
+      setRiskPortfolioResult(null);
+      setRiskPortfolioError(error?.message || "Impossibile analizzare il paniere.");
+    } finally {
+      setRiskPortfolioLoading(false);
     }
   };
 
@@ -1604,13 +1801,16 @@ const Home = ({
         }}
       >
         <button
+          type="button"
           className="remove-chip"
+          aria-label={`Rimuovi ${ticker} dalla watchlist`}
+          data-tooltip="Rimuovi dalla watchlist"
           onClick={(e) => {
             e.stopPropagation();
             removeFromWatchlist(ticker);
           }}
         >
-          Rimuovi
+          <FiX aria-hidden="true" />
         </button>
 
         <div className="watchlist-card-head">
@@ -1637,7 +1837,16 @@ const Home = ({
           </div>
         </div>
 
-        <div className="watchlist-open">Apri analisi</div>
+        <button
+          type="button"
+          className="watchlist-open"
+          onClick={(event) => {
+            event.stopPropagation();
+            navigate(`/search?query=${encodeURIComponent(ticker)}`);
+          }}
+        >
+          Apri analisi
+        </button>
       </article>
     );
   };
@@ -1797,8 +2006,8 @@ const Home = ({
       datasets: [
         {
           data: portfolioAnalytics.trendData,
-          borderColor: darkMode ? "#7b8cff" : "#4e5dcc",
-          backgroundColor: darkMode ? "rgba(123, 140, 255, 0.16)" : "rgba(78, 93, 204, 0.16)",
+          borderColor: darkMode ? "#2bd3b1" : "#168f77",
+          backgroundColor: darkMode ? "rgba(43, 211, 177, 0.15)" : "rgba(22, 143, 119, 0.13)",
           fill: true,
           borderWidth: 2,
           tension: 0.32,
@@ -1848,7 +2057,7 @@ const Home = ({
         {
           data: portfolioAnalytics.pieSlices.map((slice) => slice.count),
           backgroundColor: portfolioAnalytics.pieSlices.map((slice) => slice.color),
-          borderColor: darkMode ? "#0f172a" : "#ffffff",
+          borderColor: darkMode ? "#142234" : "#ffffff",
           borderWidth: 2,
           hoverOffset: 8,
         },
@@ -1876,6 +2085,57 @@ const Home = ({
     }),
     []
   );
+
+  const markowitzFrontierData = useMemo(() => {
+    const frontier = riskPortfolioResult?.markowitz?.efficientFrontier || [];
+    if (!frontier.length) return null;
+    const minVariance = riskPortfolioResult.markowitz.minimumVariance;
+    const maxSharpe = riskPortfolioResult.markowitz.maximumSharpe;
+    return {
+      datasets: [
+        {
+          label: "Frontiera efficiente",
+          data: frontier.map((point) => ({ x: point.volatility * 100, y: point.expectedReturn * 100 })),
+          borderColor: darkMode ? "#2bd3b1" : "#0f765f",
+          backgroundColor: darkMode ? "rgba(43,211,177,.35)" : "rgba(15,118,95,.28)",
+          showLine: true,
+          tension: 0.24,
+          pointRadius: 3,
+          pointHoverRadius: 5,
+        },
+        {
+          label: "Minima varianza",
+          data: [{ x: minVariance.volatility * 100, y: minVariance.expectedReturn * 100 }],
+          backgroundColor: "#3b82f6",
+          borderColor: "#3b82f6",
+          pointRadius: 6,
+          pointStyle: "rectRot",
+        },
+        {
+          label: "Massimo Sharpe",
+          data: [{ x: maxSharpe.volatility * 100, y: maxSharpe.expectedReturn * 100 }],
+          backgroundColor: "#f59e0b",
+          borderColor: "#f59e0b",
+          pointRadius: 6,
+          pointStyle: "triangle",
+        },
+      ],
+    };
+  }, [riskPortfolioResult, darkMode]);
+
+  const markowitzFrontierOptions = useMemo(() => ({
+    responsive: true,
+    maintainAspectRatio: false,
+    interaction: { mode: "nearest", intersect: false },
+    plugins: {
+      legend: { position: "bottom", labels: { color: darkMode ? "#dbe5f2" : "#344054", usePointStyle: true } },
+      tooltip: { callbacks: { label: (context) => `${context.dataset.label}: rischio ${Number(context.parsed.x).toFixed(1)}% · rendimento ${Number(context.parsed.y).toFixed(1)}%` } },
+    },
+    scales: {
+      x: { type: "linear", title: { display: true, text: "Volatilità annualizzata (%)", color: darkMode ? "#dbe5f2" : "#344054" }, ticks: { color: darkMode ? "#b9c6d8" : "#667085" }, grid: { color: darkMode ? "rgba(148,163,184,.18)" : "rgba(148,163,184,.2)" } },
+      y: { title: { display: true, text: "Rendimento atteso (%)", color: darkMode ? "#dbe5f2" : "#344054" }, ticks: { color: darkMode ? "#b9c6d8" : "#667085" }, grid: { color: darkMode ? "rgba(148,163,184,.18)" : "rgba(148,163,184,.2)" } },
+    },
+  }), [darkMode]);
 
   const portfolioRows = useMemo(() => {
     const items = portfolioEntries.map((entry) => {
@@ -1927,7 +2187,71 @@ const Home = ({
   return (
     <div className={`home-page ${darkMode ? "dark" : "light"}`}>
       <div className="home-content">
+        <header className="home-dashboard-hero">
+          <div className="home-dashboard-copy">
+            <span className="home-dashboard-eyebrow">
+              <i aria-hidden="true" />
+              Dashboard personale
+            </span>
+            <h1>Bentornato, {user?.username || "investitore"}</h1>
+            <p>
+              Monitora portafogli, watchlist e segnali da un'unica vista chiara e aggiornata.
+            </p>
+
+            <div className="home-dashboard-stats" aria-label="Riepilogo della dashboard">
+              <div>
+                <FiEye aria-hidden="true" />
+                <span>
+                  <strong>{normalizedWatchlist.length}</strong> titoli monitorati
+                </span>
+              </div>
+              <div>
+                <FiBriefcase aria-hidden="true" />
+                <span>
+                  <strong>{portfolioCollection.items.length}</strong> portafogli
+                </span>
+              </div>
+              <div>
+                <FiActivity aria-hidden="true" />
+                <span>
+                  <strong>
+                    {portfolioEntries.filter((entry) => entry.status !== "sold").length}
+                  </strong>{" "}
+                  posizioni aperte
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div className="home-dashboard-actions">
+            <button type="button" className="home-dashboard-primary" onClick={() => navigate("/search")}>
+              <FiSearch aria-hidden="true" />
+              Cerca titolo
+              <FiArrowUpRight className="home-action-arrow" aria-hidden="true" />
+            </button>
+            <button type="button" className="home-dashboard-secondary" onClick={() => navigate("/social")}>
+              <FiUsers aria-hidden="true" />
+              Esplora portafogli
+            </button>
+          </div>
+        </header>
+
         <section className={`portfolio-overview-card ${darkMode ? "dark" : "light"}`}>
+          <div className="home-section-heading">
+            <span className="home-section-icon" aria-hidden="true">
+              <FiBarChart2 />
+            </span>
+            <div className="home-section-heading-copy">
+              <span className="home-panel-kicker">Portafoglio</span>
+              <h2>Panoramica patrimoniale</h2>
+              <p>Rendimento, andamento e composizione del portafoglio selezionato.</p>
+            </div>
+            <span className="home-section-current">
+              <i aria-hidden="true" />
+              {activePortfolio?.name || "Portafoglio"}
+            </span>
+          </div>
+
           <div className="portfolio-switcher">
             <div className="portfolio-switcher-head">
               <div className="portfolio-switcher-title">
@@ -1969,7 +2293,11 @@ const Home = ({
             </div>
 
             {showDeletePortfolioConfirm && activePortfolio && (
-              <div className="portfolio-delete-confirm">
+              <div
+                className="portfolio-delete-confirm"
+                role="alert"
+                aria-label={`Elimina ${activePortfolio.name}`}
+              >
                 <span>
                   Eliminare <strong>{activePortfolio.name}</strong>? Le sue posizioni verranno
                   rimosse definitivamente.
@@ -1988,7 +2316,10 @@ const Home = ({
 
           <div className="portfolio-overview-kpis">
             <article className="overview-kpi">
-              <span>Ritorno Portafoglio</span>
+              <div className="overview-kpi-top">
+                <span>Ritorno Portafoglio</span>
+                <FiTrendingUp aria-hidden="true" />
+              </div>
               <strong
                 className={`${
                   portfolioAnalytics.summary.total.returnPct > 0
@@ -2002,7 +2333,10 @@ const Home = ({
               </strong>
             </article>
             <article className="overview-kpi">
-              <span>Ritorno Aperto</span>
+              <div className="overview-kpi-top">
+                <span>Ritorno Aperto</span>
+                <FiActivity aria-hidden="true" />
+              </div>
               <strong
                 className={`${
                   portfolioAnalytics.summary.open.returnPct > 0
@@ -2016,7 +2350,10 @@ const Home = ({
               </strong>
             </article>
             <article className="overview-kpi">
-              <span>Ritorno Chiuso</span>
+              <div className="overview-kpi-top">
+                <span>Ritorno Chiuso</span>
+                <FiCheckCircle aria-hidden="true" />
+              </div>
               <strong
                 className={`${
                   portfolioAnalytics.summary.closed.returnPct > 0
@@ -2037,7 +2374,11 @@ const Home = ({
                 <h4>Andamento Portafoglio</h4>
                 <span>chiuso + tratto live aperto</span>
               </div>
-              <div className="overview-line-wrap">
+              <div
+                className="overview-line-wrap"
+                role="img"
+                aria-label="Grafico dell'andamento percentuale del portafoglio"
+              >
                 <Line data={performanceLineData} options={performanceLineOptions} />
               </div>
             </article>
@@ -2074,10 +2415,57 @@ const Home = ({
           </div>
         </section>
 
+        <section className={`risk-selection-card ${darkMode ? "dark" : "light"}`} aria-labelledby="risk-selection-title">
+          <div className="home-section-heading risk-selection-heading">
+            <span className="home-section-icon" aria-hidden="true"><FiShield /></span>
+            <div className="home-section-heading-copy">
+              <span className="home-panel-kicker">Portfolio risk lab</span>
+              <h2 id="risk-selection-title">Quali titoli tenere?</h2>
+              <p>Inserisci ticker, nomi o codici ISIN e valuta diversificazione, volatilità, correlazioni e drawdown su 5 anni.</p>
+            </div>
+            <span className="risk-selection-limit">max 50.000 ticker</span>
+          </div>
+          <div className="risk-selection-form">
+            <input
+              aria-label="Titoli da analizzare per il rischio di portafoglio"
+              value={riskPortfolioInput}
+              onChange={(event) => setRiskPortfolioInput(event.target.value)}
+              onKeyDown={(event) => event.key === "Enter" && addRiskPortfolioTickers()}
+              placeholder="AAPL, Apple, IE00B4L5Y983..."
+            />
+            <button type="button" onClick={addRiskPortfolioTickers} disabled={riskPortfolioResolving}>{riskPortfolioResolving ? "Riconosco..." : "Aggiungi titoli"}</button>
+            <button type="button" className="risk-selection-primary" onClick={analyzeRiskPortfolio} disabled={riskPortfolioResolving || riskPortfolioLoading || riskPortfolioTickers.length < 2}>
+              {riskPortfolioLoading ? "Analisi..." : "Analizza rischio"}
+            </button>
+          </div>
+          {riskPortfolioTickers.length > 0 && <div className="risk-selection-tickers" aria-label="Titoli selezionati">{riskPortfolioTickers.slice(0, 120).map((ticker) => <button type="button" key={ticker} onClick={() => removeRiskPortfolioTicker(ticker)} title={`Rimuovi ${ticker}`}>{ticker}<FiX aria-hidden="true" /></button>)}{riskPortfolioTickers.length > 120 && <span className="risk-selection-more">+ {riskPortfolioTickers.length - 120} altri titoli</span>}</div>}
+          {riskPortfolioConversions.length > 0 && <p className="risk-selection-conversions" role="status">Convertiti automaticamente: {riskPortfolioConversions.join(", ")}{riskPortfolioConversions.length >= 20 ? "…" : ""}</p>}
+          {riskPortfolioLoading && <div className="risk-selection-progress" role="status"><span style={{ width: `${riskPortfolioProgress.total ? (riskPortfolioProgress.completed / riskPortfolioProgress.total) * 100 : 0}%` }} /><small>Storici verificati: {riskPortfolioProgress.completed.toLocaleString("it-IT")} / {riskPortfolioProgress.total.toLocaleString("it-IT")}</small></div>}
+          {riskPortfolioError && <p className="risk-selection-error" role="alert">{riskPortfolioError}</p>}
+          {riskPortfolioResult && (
+            <div className="risk-selection-results">
+              <div className="risk-selection-summary">
+                <div><span>Titoli da mantenere</span><strong>{riskPortfolioResult.selectedTickers.join(" · ") || "—"}</strong></div>
+                <div><span>Volatilità paniere</span><strong>{Number.isFinite(riskPortfolioResult.portfolio.volatility) ? `${(riskPortfolioResult.portfolio.volatility * 100).toFixed(1)}%` : "—"}</strong></div>
+                <div><span>Metodo</span><strong>Markowitz · minimum variance</strong></div>
+                <div><span>Rendimento atteso</span><strong>{Number.isFinite(riskPortfolioResult.portfolio.averageReturn) ? `${(riskPortfolioResult.portfolio.averageReturn * 100).toFixed(1)}%` : "—"}</strong></div>
+                <div><span>Sharpe ex-ante</span><strong>{Number.isFinite(riskPortfolioResult.portfolio.sharpe) ? riskPortfolioResult.portfolio.sharpe.toFixed(2) : "—"}</strong></div>
+              </div>
+              {markowitzFrontierData && <div className="risk-frontier-chart"><div className="risk-frontier-heading"><strong>Frontiera efficiente di Markowitz</strong><span>Ogni punto rappresenta il portafoglio a varianza minima per un rendimento obiettivo.</span></div><Scatter data={markowitzFrontierData} options={markowitzFrontierOptions} role="img" aria-label="Frontiera efficiente di Markowitz." /></div>}
+              <div className="risk-selection-table-wrap"><table><thead><tr><th>Titolo</th><th>Decisione</th><th>Peso indicativo</th><th>Volatilità</th><th>Max DD</th><th>Motivazione</th></tr></thead><tbody>{riskPortfolioResult.recommendations.slice(0, 100).map((item) => <tr key={item.ticker} className={item.decision === "mantieni" ? "risk-keep" : "risk-reduce"}><th>{item.ticker}</th><td><span className={`risk-decision risk-decision-${item.decision}`}>{item.decision}</span></td><td>{(item.weight * 100).toFixed(1)}%</td><td>{(item.volatility * 100).toFixed(1)}%</td><td>{(item.maxDrawdown * 100).toFixed(1)}%</td><td>{item.reasons.join("; ")}</td></tr>)}</tbody></table></div>
+              {riskPortfolioResult.recommendations.length > 100 && <p className="risk-selection-disclaimer">Mostrati i primi 100 risultati; la selezione completa resta disponibile nel calcolo del paniere.</p>}
+              {riskPortfolioResult.skippedTickers?.length > 0 && <p className="risk-selection-disclaimer">Titoli esclusi per storico mancante o insufficiente: {riskPortfolioResult.skippedTickers.length.toLocaleString("it-IT")}.</p>}
+              <p className="risk-selection-disclaimer">La selezione usa il portafoglio a varianza minima di Markowitz. Il motore calcola anche l’alternativa a massimo Sharpe, mantenendo separati rendimento atteso e rischio stimato.</p>
+              <p className="risk-selection-disclaimer">{riskPortfolioResult.disclaimer}</p>
+            </div>
+          )}
+        </section>
+
         <div className="home-columns">
           <section className={`watchlist-shell ${darkMode ? "dark" : "light"}`}>
             <div className="watchlist-header">
               <div>
+                <span className="home-panel-kicker">Monitoraggio</span>
                 <div className="watchlist-title-row">
                   <h3>Watchlist</h3>
                   <div className="watchlist-timeframe-control">
@@ -2091,6 +2479,7 @@ const Home = ({
                             watchlistSignalTimeframe === option.value ? "active" : ""
                           }
                           onClick={() => setWatchlistSignalTimeframe(option.value)}
+                          aria-pressed={watchlistSignalTimeframe === option.value}
                         >
                           {option.label}
                         </button>
@@ -2100,31 +2489,59 @@ const Home = ({
                 </div>
                 <p>{normalizedWatchlist.length} titoli monitorati - trascina le card per riordinarle</p>
               </div>
-              <button className="add-watchlist-btn" onClick={() => setShowAddBox(!showAddBox)}>
+              <button
+                type="button"
+                className="add-watchlist-btn"
+                onClick={() => setShowAddBox(!showAddBox)}
+                aria-expanded={showAddBox}
+              >
                 + Aggiungi
               </button>
             </div>
 
-            {watchlistLoading && <div className="watchlist-sync-note">Sincronizzazione in corso...</div>}
-            {watchlistError && <div className="watchlist-sync-error">{watchlistError}</div>}
+            {watchlistLoading && (
+              <div className="watchlist-sync-note" aria-live="polite">
+                Sincronizzazione in corso...
+              </div>
+            )}
+            {watchlistError && (
+              <div className="watchlist-sync-error" role="alert">
+                {watchlistError}
+              </div>
+            )}
 
             {showAddBox && (
               <div className={`add-box ${darkMode ? "dark" : "light"}`}>
                 <h5>Cerca un titolo da aggiungere</h5>
                 <div className="add-box-actions">
                   <input
+                    aria-label="Ticker da aggiungere alla watchlist"
                     placeholder="Inserisci ticker (es: AAPL)"
                     value={searchInput}
                     onChange={(e) => setSearchInput(e.target.value.toUpperCase())}
                     onKeyDown={(e) => e.key === "Enter" && searchTickerForWatchlist()}
                   />
-                  <button className="search-add-btn" onClick={searchTickerForWatchlist}>
+                  <button type="button" className="search-add-btn" onClick={searchTickerForWatchlist}>
                     Cerca
                   </button>
                 </div>
-                {searchError && <p className="search-error">{searchError}</p>}
+                {searchError && (
+                  <p className="search-error" role="alert">
+                    {searchError}
+                  </p>
+                )}
                 {searchResult && (
-                  <div className="search-result" onClick={handleSelectSearchResult}>
+                  <div
+                    className="search-result"
+                    role="button"
+                    tabIndex={0}
+                    onClick={handleSelectSearchResult}
+                    onKeyDown={(event) => {
+                      if (event.key !== "Enter" && event.key !== " ") return;
+                      event.preventDefault();
+                      handleSelectSearchResult();
+                    }}
+                  >
                     <strong>{searchResult.ticker}</strong>
                     {searchResult.info?.currentPrice != null && (
                       <span> - prezzo: {fmtEuro(searchResult.info.currentPrice)}</span>
@@ -2145,15 +2562,22 @@ const Home = ({
           </section>
 
           <section className={`portfolio-shell transactions-card ${darkMode ? "dark" : "light"}`}>
-            <button
-              className="create-portfolio-btn portfolio-create-launch-btn"
-              type="button"
-              onClick={() => setShowCreatePortfolioCard((prev) => !prev)}
-              aria-expanded={showCreatePortfolioCard}
-              aria-controls="portfolio-create-card"
-            >
-              {showCreatePortfolioCard ? "Chiudi nuovo portafoglio" : "Nuovo portafoglio"}
-            </button>
+            <div className="home-portfolio-command">
+              <div>
+                <span className="home-panel-kicker">Gestione posizioni</span>
+                <h3>Il tuo portafoglio</h3>
+                <p>Aggiungi titoli e controlla l'andamento delle operazioni.</p>
+              </div>
+              <button
+                className="create-portfolio-btn portfolio-create-launch-btn"
+                type="button"
+                onClick={() => setShowCreatePortfolioCard((prev) => !prev)}
+                aria-expanded={showCreatePortfolioCard}
+                aria-controls="portfolio-create-card"
+              >
+                {showCreatePortfolioCard ? "Chiudi" : "+ Nuovo"}
+              </button>
+            </div>
 
             {showCreatePortfolioCard && (
               <div className="portfolio-create-row" id="portfolio-create-card">
@@ -2209,17 +2633,22 @@ const Home = ({
 
             <div className="portfolio-add-row">
               <input
+                aria-label="Ticker da aggiungere al portafoglio"
                 placeholder="Ticker (es: ENI.MI)"
                 value={portfolioInput}
                 onChange={(e) => setPortfolioInput(e.target.value.toUpperCase())}
                 onKeyDown={(e) => e.key === "Enter" && addToPortfolio()}
               />
-              <button className="add-watchlist-btn" onClick={addToPortfolio}>
+              <button type="button" className="add-watchlist-btn" onClick={addToPortfolio}>
                 + Inserisci
               </button>
             </div>
 
-            {portfolioError && <div className="watchlist-sync-error">{portfolioError}</div>}
+            {(portfolioError || portfolioStorageError) && (
+              <div className="watchlist-sync-error" role="alert">
+                {portfolioStorageError || portfolioError}
+              </div>
+            )}
 
             <div className="transactions-head">
               <div className="transactions-head-main">
@@ -2272,9 +2701,9 @@ const Home = ({
                 </button>
               </div>
               <div className="transactions-head-actions">
-                <button className="transactions-view-btn" type="button">
+                <span className="transactions-view-btn">
                   {portfolioCollection.items.length} portafogli
-                </button>
+                </span>
               </div>
             </div>
 
@@ -2283,6 +2712,7 @@ const Home = ({
                 type="button"
                 className={portfolioView === "bought" ? "active" : ""}
                 onClick={() => setPortfolioView("bought")}
+                aria-pressed={portfolioView === "bought"}
               >
                 Aperto
               </button>
@@ -2290,6 +2720,7 @@ const Home = ({
                 type="button"
                 className={portfolioView === "sold" ? "active" : ""}
                 onClick={() => setPortfolioView("sold")}
+                aria-pressed={portfolioView === "sold"}
               >
                 Chiuso
               </button>
@@ -2313,10 +2744,17 @@ const Home = ({
                   >
                     <div className={`tx-avatar ${row.tone}`}>{row.ticker.charAt(0)}</div>
 
-                    <div className="tx-meta">
+                    <button
+                      type="button"
+                      className="tx-meta"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        navigate(`/Previsione?ticker=${encodeURIComponent(row.ticker)}`);
+                      }}
+                    >
                       <strong>{row.ticker}</strong>
                       <span>{row.shortName}</span>
-                    </div>
+                    </button>
 
                     <div className="tx-stat">
                       <strong>{fmtEuro(row.initialPrice)}</strong>
@@ -2372,6 +2810,7 @@ const Home = ({
         <section className={`saved-social-shell ${darkMode ? "dark" : "light"}`}>
           <div className="saved-social-head">
             <div>
+              <span className="home-panel-kicker">Community</span>
               <h3>Portafogli Salvati</h3>
               <p>
                 Qui vedi titoli attuali e movimenti recenti (compra/vendi) dei portafogli che hai
@@ -2388,9 +2827,13 @@ const Home = ({
           </div>
 
           {savedSocialLoading && savedSocialPortfolios.length === 0 ? (
-            <div className="saved-social-status">Caricamento portafogli salvati...</div>
+            <div className="saved-social-status" aria-live="polite">
+              Caricamento portafogli salvati...
+            </div>
           ) : savedSocialError ? (
-            <div className="saved-social-error">{savedSocialError}</div>
+            <div className="saved-social-error" role="alert">
+              {savedSocialError}
+            </div>
           ) : savedSocialPortfolios.length === 0 ? (
             <div className="saved-social-status">
               Nessun portafoglio salvato. Apri Lista Portafogli e salva quelli che vuoi seguire.

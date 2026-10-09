@@ -12,8 +12,73 @@ import urllib.parse
 import gzip
 import os
 import secrets
+import hashlib
 import sqlite3
-from functools import wraps
+import time
+from threading import Lock
+from functools import lru_cache, wraps
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+try:
+    from ml.market_tls import configure_market_tls
+except ImportError:
+    from backend.ml.market_tls import configure_market_tls
+configure_market_tls(os.path.join(os.path.dirname(__file__), ".yf-cache"))
+
+try:
+    from ml.fundamental_model import build_feature_vector, predict_from_artifact
+    from ml.quantitative_advanced import build_quantitative_research_payload
+    from ml.heatmap_signal import build_heatmap_signal, unavailable_signal, VERSION as HEATMAP_SIGNAL_VERSION
+    from ml.analysis_pages import completed_daily_history, technical_page_payload, seasonality_page_payload, PAGE_ENGINE_VERSION
+    from ml.page_structure import calculate_supply_demand_zones, determine_market_state, filter_zones_by_distance, merge_close_zones
+    from ml.structure_neural import build_structure_neural, VERSION as STRUCTURE_NEURAL_VERSION, validate_request as validate_neural_request
+    from ml.point_in_time import (
+        V5_CATEGORICAL_FEATURE_NAMES,
+        V5_MARKET_FEATURE_NAMES,
+        V5_MARKET_MISSING_FLAG_NAMES,
+        build_market_event_features,
+        build_filing_index as build_ml_filing_index,
+        extract_annual_vintages as extract_ml_annual_vintages,
+        extract_filing_vintages as extract_ml_filing_vintages,
+        latest_usable_vintage as latest_ml_usable_vintage,
+        resolve_security_point_in_time,
+    )
+except ImportError:  # Supporta anche ``import backend.app`` dalla root.
+    from backend.ml.fundamental_model import build_feature_vector, predict_from_artifact
+    from backend.ml.quantitative_advanced import build_quantitative_research_payload
+    from backend.ml.heatmap_signal import build_heatmap_signal, unavailable_signal, VERSION as HEATMAP_SIGNAL_VERSION
+    from backend.ml.analysis_pages import completed_daily_history, technical_page_payload, seasonality_page_payload, PAGE_ENGINE_VERSION
+    from backend.ml.page_structure import calculate_supply_demand_zones, determine_market_state, filter_zones_by_distance, merge_close_zones
+    from backend.ml.structure_neural import build_structure_neural, VERSION as STRUCTURE_NEURAL_VERSION, validate_request as validate_neural_request
+    from backend.ml.point_in_time import (
+        V5_CATEGORICAL_FEATURE_NAMES,
+        V5_MARKET_FEATURE_NAMES,
+        V5_MARKET_MISSING_FLAG_NAMES,
+        build_market_event_features,
+        build_filing_index as build_ml_filing_index,
+        extract_annual_vintages as extract_ml_annual_vintages,
+        extract_filing_vintages as extract_ml_filing_vintages,
+        latest_usable_vintage as latest_ml_usable_vintage,
+        resolve_security_point_in_time,
+    )
+
+try:
+    from yfinance import const as yf_const
+except Exception:
+    yf_const = None
+
+
+YFINANCE_CACHE_DIR = (
+    os.environ.get("YFINANCE_CACHE_DIR")
+    or os.path.join(os.path.dirname(__file__), ".yf-cache")
+)
+try:
+    os.makedirs(YFINANCE_CACHE_DIR, exist_ok=True)
+    if hasattr(yf, "set_tz_cache_location"):
+        yf.set_tz_cache_location(YFINANCE_CACHE_DIR)
+except OSError:
+    # Il fallback HTTP diretto resta disponibile anche senza cache persistente.
+    pass
 
 
 
@@ -725,15 +790,239 @@ PRICE_ONLY_CACHE_TTL = timedelta(seconds=10)
 # Cache endpoint pesanti
 technicals_cache = {}
 partial_corr_cache = {}
+heatmap_relations_cache = {}
+page_daily_history_cache = {}
+structure_neural_cache = {}
+structure_neural_lock = Lock()
+heatmap_prices_cache = {}
 seasonality_cache = {}
 history_cache = {}
 supply_demand_cache = {}
+search_suggestions_cache = {}
+financials_cache = {}
+sec_reference_cache = {}
+sec_companyfacts_cache = {}
+sec_filings_cache = {}
+sec_submissions_cache = {}
+fundamental_forecast_cache = {}
+quantitative_research_cache = {}
 
 TECHNICALS_CACHE_TTL = timedelta(minutes=4)
 PARTIAL_CORR_CACHE_TTL = timedelta(minutes=12)
 SEASONALITY_CACHE_TTL = timedelta(minutes=20)
 HISTORY_CACHE_TTL = timedelta(seconds=120)
 SUPPLY_DEMAND_CACHE_TTL = timedelta(minutes=6)
+SEARCH_SUGGESTIONS_CACHE_TTL = timedelta(minutes=5)
+TRADINGVIEW_HEATMAP_CACHE_TTL = timedelta(minutes=3)
+HEATMAP_RELATIONS_CACHE_TTL = timedelta(minutes=15)
+FINANCIALS_CACHE_TTL = timedelta(minutes=30)
+SEC_REFERENCE_CACHE_TTL = timedelta(hours=24)
+SEC_COMPANYFACTS_CACHE_TTL = timedelta(hours=6)
+SEC_FILINGS_CACHE_TTL = timedelta(hours=1)
+SEC_NEGATIVE_CACHE_TTL = timedelta(minutes=2)
+FUNDAMENTAL_FORECAST_CACHE_TTL = timedelta(minutes=30)
+QUANTITATIVE_RESEARCH_CACHE_TTL = timedelta(minutes=30)
+FUNDAMENTAL_MODEL_PATH = (
+    os.environ.get("FUNDAMENTAL_MODEL_PATH")
+    or os.path.join(
+        os.path.dirname(__file__),
+        "models",
+        "fundamental_return_model.json",
+    )
+)
+FUNDAMENTAL_TRAINING_CACHE_DIR = (
+    os.environ.get("FUNDAMENTAL_TRAINING_CACHE_DIR")
+    or os.path.join(os.path.dirname(__file__), ".ml-cache")
+)
+_fundamental_model_state = {
+    "path": None,
+    "mtime": None,
+    "artifact": None,
+}
+
+FINANCIAL_STATEMENT_CONFIG = {
+    "income": {
+        "label": "Conto economico",
+        "includeTtm": True,
+        "rows": [
+            {"key": "TotalRevenue", "label": "Ricavi totali"},
+            {"key": "CostOfRevenue", "label": "Costo dei ricavi", "detail": True},
+            {"key": "GrossProfit", "label": "Utile lordo"},
+            {"key": "OperatingExpense", "label": "Spese operative"},
+            {
+                "key": "SellingGeneralAndAdministration",
+                "label": "Spese generali e amministrative",
+                "detail": True,
+            },
+            {
+                "key": "ResearchAndDevelopment",
+                "label": "Ricerca e sviluppo",
+                "detail": True,
+            },
+            {"key": "OperatingIncome", "label": "Utile operativo"},
+            {
+                "key": "NetNonOperatingInterestIncomeExpense",
+                "label": "Proventi/oneri finanziari netti",
+                "detail": True,
+            },
+            {"key": "OtherIncomeExpense", "label": "Altri proventi/oneri", "detail": True},
+            {"key": "PretaxIncome", "label": "Utile prima delle imposte"},
+            {"key": "TaxProvision", "label": "Imposte sul reddito", "detail": True},
+            {"key": "NetIncomeCommonStockholders", "label": "Utile netto agli azionisti"},
+            {
+                "key": "DilutedNIAvailtoComStockholders",
+                "label": "Utile netto diluito disponibile",
+                "detail": True,
+            },
+            {"key": "BasicEPS", "label": "EPS base", "format": "perShare"},
+            {"key": "DilutedEPS", "label": "EPS diluito", "format": "perShare"},
+            {
+                "key": "BasicAverageShares",
+                "label": "Numero medio azioni base",
+                "detail": True,
+            },
+            {
+                "key": "DilutedAverageShares",
+                "label": "Numero medio azioni diluite",
+                "detail": True,
+            },
+            {
+                "key": "TotalOperatingIncomeAsReported",
+                "label": "Utile operativo dichiarato",
+                "detail": True,
+            },
+            {"key": "TotalExpenses", "label": "Spese totali", "detail": True},
+            {"key": "NormalizedIncome", "label": "Utile normalizzato", "detail": True},
+            {"key": "InterestIncome", "label": "Interessi attivi", "detail": True},
+            {"key": "InterestExpense", "label": "Interessi passivi", "detail": True},
+            {"key": "NetInterestIncome", "label": "Interessi netti", "detail": True},
+            {"key": "EBIT", "label": "EBIT"},
+            {"key": "EBITDA", "label": "EBITDA"},
+        ],
+    },
+    "balance": {
+        "label": "Stato patrimoniale",
+        "includeTtm": False,
+        "rows": [
+            {"key": "TotalAssets", "label": "Totale attività"},
+            {"key": "CurrentAssets", "label": "Attività correnti"},
+            {
+                "key": "CashCashEquivalentsAndShortTermInvestments",
+                "label": "Liquidità e investimenti a breve",
+                "detail": True,
+            },
+            {
+                "key": "CashAndCashEquivalents",
+                "label": "Disponibilità liquide",
+                "detail": True,
+            },
+            {"key": "AccountsReceivable", "label": "Crediti commerciali", "detail": True},
+            {"key": "Inventory", "label": "Rimanenze", "detail": True},
+            {"key": "TotalNonCurrentAssets", "label": "Attività non correnti"},
+            {"key": "NetPPE", "label": "Immobili, impianti e macchinari", "detail": True},
+            {
+                "key": "GoodwillAndOtherIntangibleAssets",
+                "label": "Avviamento e attività immateriali",
+                "detail": True,
+            },
+            {
+                "key": "TotalLiabilitiesNetMinorityInterest",
+                "label": "Totale passività",
+            },
+            {"key": "CurrentLiabilities", "label": "Passività correnti"},
+            {"key": "AccountsPayable", "label": "Debiti commerciali", "detail": True},
+            {"key": "CurrentDebt", "label": "Debito corrente", "detail": True},
+            {
+                "key": "TotalNonCurrentLiabilitiesNetMinorityInterest",
+                "label": "Passività non correnti",
+            },
+            {"key": "LongTermDebt", "label": "Debito a lungo termine", "detail": True},
+            {"key": "TotalDebt", "label": "Debito totale"},
+            {"key": "NetDebt", "label": "Debito netto", "detail": True},
+            {"key": "StockholdersEquity", "label": "Patrimonio netto"},
+            {
+                "key": "TotalEquityGrossMinorityInterest",
+                "label": "Patrimonio netto incluse minoranze",
+                "detail": True,
+            },
+            {"key": "WorkingCapital", "label": "Capitale circolante", "detail": True},
+            {"key": "InvestedCapital", "label": "Capitale investito", "detail": True},
+            {"key": "TangibleBookValue", "label": "Valore contabile tangibile", "detail": True},
+            {
+                "key": "OrdinarySharesNumber",
+                "label": "Numero azioni ordinarie",
+                "detail": True,
+            },
+        ],
+    },
+    "cash": {
+        "label": "Flussi di cassa",
+        "includeTtm": True,
+        "rows": [
+            {"key": "OperatingCashFlow", "label": "Flusso di cassa operativo"},
+            {"key": "InvestingCashFlow", "label": "Flusso di cassa da investimenti"},
+            {"key": "FinancingCashFlow", "label": "Flusso di cassa da finanziamenti"},
+            {"key": "EndCashPosition", "label": "Liquidità finale"},
+            {
+                "key": "IncomeTaxPaidSupplementalData",
+                "label": "Imposte pagate",
+                "detail": True,
+            },
+            {
+                "key": "InterestPaidSupplementalData",
+                "label": "Interessi pagati",
+                "detail": True,
+            },
+            {"key": "CapitalExpenditure", "label": "Spese in conto capitale"},
+            {
+                "key": "PurchaseOfBusiness",
+                "label": "Acquisizioni di aziende",
+                "detail": True,
+            },
+            {"key": "IssuanceOfDebt", "label": "Emissione di debito", "detail": True},
+            {"key": "RepaymentOfDebt", "label": "Rimborso del debito", "detail": True},
+            {
+                "key": "IssuanceOfCapitalStock",
+                "label": "Emissione di capitale",
+                "detail": True,
+            },
+            {
+                "key": "RepurchaseOfCapitalStock",
+                "label": "Riacquisto di azioni",
+                "detail": True,
+            },
+            {"key": "CashDividendsPaid", "label": "Dividendi pagati", "detail": True},
+            {
+                "key": "ChangeInWorkingCapital",
+                "label": "Variazione capitale circolante",
+                "detail": True,
+            },
+            {"key": "ChangeInInventory", "label": "Variazione rimanenze", "detail": True},
+            {
+                "key": "ChangeInReceivables",
+                "label": "Variazione crediti",
+                "detail": True,
+            },
+            {"key": "ChangeInPayable", "label": "Variazione debiti", "detail": True},
+            {
+                "key": "StockBasedCompensation",
+                "label": "Compensi basati su azioni",
+                "detail": True,
+            },
+            {
+                "key": "DepreciationAndAmortization",
+                "label": "Ammortamenti e svalutazioni",
+                "detail": True,
+            },
+            {
+                "key": "NetIncomeFromContinuingOperations",
+                "label": "Utile netto da attività continuative",
+                "detail": True,
+            },
+            {"key": "FreeCashFlow", "label": "Free cash flow"},
+        ],
+    },
+}
 
 def _cache_get(cache_dict, key, ttl):
     entry = cache_dict.get(key)
@@ -748,6 +1037,30 @@ def _cache_get(cache_dict, key, ttl):
         pass
     return None
 
+
+def _cache_get_adaptive(
+    cache_dict,
+    key,
+    positive_ttl,
+    *,
+    is_negative=None,
+    negative_ttl=SEC_NEGATIVE_CACHE_TTL,
+):
+    """Usa una TTL breve per gli errori temporanei memorizzati in cache.
+
+    Le sorgenti SEC possono fallire per timeout o rate limit. Conservare un
+    payload vuoto per ore rende un ticker esistente artificialmente
+    indisponibile anche dopo il ripristino della sorgente.
+    """
+
+    entry = cache_dict.get(key)
+    if not entry:
+        return None
+    payload = entry[0]
+    predicate = is_negative or (lambda value: not value)
+    ttl = negative_ttl if predicate(payload) else positive_ttl
+    return _cache_get(cache_dict, key, ttl)
+
 def _cache_set(cache_dict, key, payload, max_size=300):
     cache_dict[key] = (payload, datetime.utcnow())
     # Bound memory: rimuove la chiave più vecchia quando supera soglia
@@ -757,6 +1070,23 @@ def _cache_set(cache_dict, key, payload, max_size=300):
             del cache_dict[oldest_key]
         except Exception:
             pass
+
+
+def _json_safe(value):
+    """Converte ricorsivamente i tipi numerici in JSON RFC-compliant."""
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (np.floating, float)):
+        numeric = float(value)
+        return numeric if np.isfinite(numeric) else None
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    return value
+
 
 TF_MAPPING = {
     "1h": "60m",
@@ -812,12 +1142,14 @@ def fundamentals_candidates(raw):
 
 def safe_history(stock, *args, **kwargs):
     try:
+        kwargs.setdefault("timeout", 8)
         return stock.history(*args, **kwargs)
     except Exception:
         return pd.DataFrame()
 
 def safe_download(*args, **kwargs):
     try:
+        kwargs.setdefault("timeout", 8)
         return yf.download(*args, **kwargs)
     except Exception:
         return pd.DataFrame()
@@ -833,10 +1165,53 @@ def _resample_ohlc(df, rule):
     out = df.resample(rule).agg(agg)
     return out.dropna(subset=["Close"])
 
+
+def _resample_ohlc_by_bar_count(df, bars_per_bucket=4):
+    """Aggrega barre intraday senza mescolare sedute di borsa differenti."""
+    source = _prepare_ohlc_df(df, require_complete=True)
+    if source.empty or not isinstance(source.index, pd.DatetimeIndex):
+        return pd.DataFrame()
+
+    frames = []
+    for _, session in source.groupby(source.index.normalize(), sort=True):
+        session = session.sort_index()
+        bucket = pd.Series(
+            np.arange(len(session), dtype="int64") // max(int(bars_per_bucket), 1),
+            index=session.index,
+        )
+        grouped = session.groupby(bucket).agg(
+            {
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+                "Volume": "sum",
+            }
+        )
+        grouped.index = [
+            session.index[min(int(group_id) * bars_per_bucket, len(session) - 1)]
+            for group_id in grouped.index
+        ]
+        frames.append(grouped)
+
+    if not frames:
+        return pd.DataFrame()
+    return _prepare_ohlc_df(pd.concat(frames).sort_index(), require_complete=True)
+
+
 def _normalize_ohlc_df(df):
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame()
+    inherited_invalid_rows = 0
+    try:
+        inherited_invalid_rows = max(
+            int(df.attrs.get("invalidRowsRemoved", 0)),
+            0,
+        )
+    except (TypeError, ValueError):
+        inherited_invalid_rows = 0
     out = df.copy()
+    original_row_count = len(out)
     if isinstance(out.columns, pd.MultiIndex):
         # yfinance.download può restituire MultiIndex anche per un solo ticker
         try:
@@ -853,37 +1228,309 @@ def _normalize_ohlc_df(df):
                 out.index = out.index.tz_localize(None)
             except Exception:
                 pass
-    return out.sort_index()
+    for col in (
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Adj Close",
+        "Volume",
+        "Dividends",
+        "Stock Splits",
+    ):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    out = out.replace([np.inf, -np.inf], np.nan)
+    if "Close" in out.columns:
+        out = out.dropna(subset=["Close"])
+    out = out.sort_index()
+    out.attrs["invalidRowsRemoved"] = (
+        inherited_invalid_rows + max(original_row_count - len(out), 0)
+    )
+    return out
+
+
+def _prepare_ohlc_df(df, require_complete=True):
+    """Normalizza OHLC e impedisce che NaN/Infinity arrivino al JSON."""
+    out = _normalize_ohlc_df(df)
+    if out.empty:
+        return pd.DataFrame()
+    inherited_invalid_rows = int(out.attrs.get("invalidRowsRemoved", 0) or 0)
+    original_row_count = len(out)
+
+    for col in ("Open", "High", "Low", "Close"):
+        if col not in out.columns:
+            out[col] = np.nan
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    if "Volume" not in out.columns:
+        out["Volume"] = 0.0
+    out["Volume"] = pd.to_numeric(out["Volume"], errors="coerce").fillna(0.0)
+    for column in ("Dividends", "Stock Splits"):
+        if column not in out.columns:
+            out[column] = 0.0
+        out[column] = pd.to_numeric(out[column], errors="coerce").fillna(0.0)
+    out = out.replace([np.inf, -np.inf], np.nan)
+    out[["Volume", "Dividends", "Stock Splits"]] = out[
+        ["Volume", "Dividends", "Stock Splits"]
+    ].fillna(0.0)
+
+    required = ["Open", "High", "Low", "Close"] if require_complete else ["Close"]
+    out = out.dropna(subset=required).sort_index()
+    out.attrs["invalidRowsRemoved"] = (
+        inherited_invalid_rows + max(original_row_count - len(out), 0)
+    )
+    return out
+
+
+def _valid_market_number(value, allow_zero=False):
+    if isinstance(value, dict):
+        value = value.get("raw")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(number):
+        return None
+    if number < 0 or (number == 0 and not allow_zero):
+        return None
+    return number
+
+
+def _market_timestamp_from_meta(meta):
+    raw_timestamp = _valid_market_number(
+        (meta or {}).get("regularMarketTime"),
+        allow_zero=False,
+    )
+    if raw_timestamp is None:
+        return None
+
+    timestamp = pd.to_datetime(raw_timestamp, unit="s", utc=True, errors="coerce")
+    if pd.isna(timestamp):
+        return None
+
+    exchange_timezone = (meta or {}).get("exchangeTimezoneName")
+    if exchange_timezone:
+        try:
+            timestamp = timestamp.tz_convert(exchange_timezone)
+        except Exception:
+            pass
+    try:
+        return timestamp.tz_localize(None)
+    except TypeError:
+        return timestamp
+
+
+def _market_state_from_meta(meta):
+    state = str((meta or {}).get("marketState") or "").strip().upper()
+    if state:
+        return state
+
+    now_epoch = datetime.now(timezone.utc).timestamp()
+    periods = (meta or {}).get("currentTradingPeriod") or {}
+    for key, label in (("regular", "REGULAR"), ("pre", "PRE"), ("post", "POST")):
+        period = periods.get(key) or {}
+        start = _valid_market_number(period.get("start"), allow_zero=False)
+        end = _valid_market_number(period.get("end"), allow_zero=False)
+        if start is not None and end is not None and start <= now_epoch <= end:
+            return label
+    return "CLOSED" if periods else "UNKNOWN"
+
+
+def _market_snapshot_frame(meta):
+    meta = meta or {}
+    price = _valid_market_number(meta.get("regularMarketPrice"))
+    timestamp = _market_timestamp_from_meta(meta)
+    if price is None or timestamp is None:
+        return pd.DataFrame()
+
+    open_price = _valid_market_number(meta.get("regularMarketOpen")) or price
+    high_price = _valid_market_number(meta.get("regularMarketDayHigh")) or price
+    low_price = _valid_market_number(meta.get("regularMarketDayLow")) or price
+    high_price = max(high_price, open_price, price)
+    low_price = min(low_price, open_price, price)
+    volume = _valid_market_number(
+        meta.get("regularMarketVolume"),
+        allow_zero=True,
+    )
+
+    return pd.DataFrame(
+        {
+            "Open": [open_price],
+            "High": [high_price],
+            "Low": [low_price],
+            "Close": [price],
+            "Volume": [volume if volume is not None else 0.0],
+        },
+        index=pd.DatetimeIndex([timestamp]),
+    )
+
+
+def _merge_daily_market_data(*frames):
+    """Unisce fonti giornaliere scegliendo l'ultima versione valida per seduta."""
+    prepared_frames = []
+    for frame in frames:
+        prepared = _prepare_ohlc_df(frame, require_complete=False)
+        if prepared.empty or not isinstance(prepared.index, pd.DatetimeIndex):
+            continue
+        prepared = prepared.copy()
+        for column in ("Open", "High", "Low"):
+            prepared[column] = prepared[column].fillna(prepared["Close"])
+        prepared["Volume"] = prepared["Volume"].fillna(0.0)
+        prepared.index = prepared.index.normalize()
+        prepared_frames.append(prepared[["Open", "High", "Low", "Close", "Volume"]])
+
+    if not prepared_frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(prepared_frames, axis=0, sort=False)
+    combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+    return _prepare_ohlc_df(combined, require_complete=True)
+
+
+def _fetch_latest_daily_market_data(ticker, base_daily_data):
+    """Completa lo storico corto con l'ultima seduta indicata dai metadata Yahoo."""
+    chart_daily, chart_meta = _fetch_chart_data(ticker, "1mo", "1d")
+    snapshot = _market_snapshot_frame(chart_meta)
+    merged = _merge_daily_market_data(base_daily_data, chart_daily, snapshot)
+    if merged.empty:
+        merged = _merge_daily_market_data(base_daily_data)
+    return merged, chart_meta or {}
+
+
+def _price_metadata(daily_data, chart_meta):
+    prepared = _prepare_ohlc_df(daily_data, require_complete=True)
+    if prepared.empty:
+        return {
+            "currentPrice": None,
+            "previousClose": None,
+            "dailyLow": None,
+            "dailyHigh": None,
+            "dailyOpen": None,
+            "dailyChange": None,
+            "priceDate": None,
+            "priceTimestamp": None,
+            "priceSource": None,
+            "marketState": _market_state_from_meta(chart_meta),
+        }
+
+    latest = prepared.iloc[-1]
+    latest_date = pd.Timestamp(prepared.index[-1]).strftime("%Y-%m-%d")
+    previous_close = (
+        _valid_market_number(prepared["Close"].iloc[-2])
+        if len(prepared) >= 2
+        else None
+    )
+    current_price = _valid_market_number(latest.get("Close"))
+    daily_change = None
+    if current_price is not None and previous_close is not None:
+        daily_change = round(
+            ((current_price - previous_close) / previous_close) * 100,
+            2,
+        )
+
+    meta_timestamp = _market_timestamp_from_meta(chart_meta)
+    meta_date = meta_timestamp.strftime("%Y-%m-%d") if meta_timestamp is not None else None
+    market_price = _valid_market_number((chart_meta or {}).get("regularMarketPrice"))
+    uses_market_snapshot = (
+        meta_date == latest_date
+        and market_price is not None
+        and current_price is not None
+        and np.isclose(market_price, current_price, rtol=1e-9, atol=1e-9)
+    )
+    timestamp_iso = None
+    if uses_market_snapshot:
+        raw_timestamp = _valid_market_number(
+            (chart_meta or {}).get("regularMarketTime"),
+            allow_zero=False,
+        )
+        if raw_timestamp is not None:
+            timestamp_iso = (
+                datetime.fromtimestamp(raw_timestamp, tz=timezone.utc)
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+
+    return {
+        "currentPrice": current_price,
+        "previousClose": previous_close,
+        "dailyLow": _valid_market_number(latest.get("Low")),
+        "dailyHigh": _valid_market_number(latest.get("High")),
+        "dailyOpen": _valid_market_number(latest.get("Open")),
+        "dailyChange": daily_change,
+        "priceDate": latest_date,
+        "priceTimestamp": timestamp_iso or latest_date,
+        "priceSource": "market" if uses_market_snapshot else "history",
+        "marketState": _market_state_from_meta(chart_meta),
+    }
+
 
 def _fetch_interval_history(cand, stock, period, interval, chart_range):
-    hist = _normalize_ohlc_df(safe_history(stock, period=period, interval=interval))
+    requested_interval = interval
+    provider_interval = "60m" if requested_interval == "240m" else requested_interval
+    hist = _normalize_ohlc_df(
+        safe_history(
+            stock,
+            period=period,
+            interval=provider_interval,
+            auto_adjust=False,
+            actions=True,
+        )
+    )
     if hist.empty:
         hist = _normalize_ohlc_df(
-            safe_download(cand, period=period, interval=interval, progress=False, threads=False)
+            safe_download(
+                cand,
+                period=period,
+                interval=provider_interval,
+                auto_adjust=False,
+                actions=True,
+                progress=False,
+                threads=False,
+            )
         )
 
     # Per weekly/monthly preferisci ricostruzione da daily: è più stabile e precisa
     # quando Yahoo limita il numero di punti per interval=1wk/1mo.
-    if hist.empty and interval in ("1wk", "1mo"):
-        daily = _normalize_ohlc_df(safe_history(stock, period=period, interval="1d"))
+    if hist.empty and requested_interval in ("1wk", "1mo"):
+        daily = _normalize_ohlc_df(
+            safe_history(
+                stock,
+                period=period,
+                interval="1d",
+                auto_adjust=False,
+                actions=True,
+            )
+        )
         if daily.empty:
             daily = _normalize_ohlc_df(
-                safe_download(cand, period=period, interval="1d", progress=False, threads=False)
+                safe_download(
+                    cand,
+                    period=period,
+                    interval="1d",
+                    auto_adjust=False,
+                    actions=True,
+                    progress=False,
+                    threads=False,
+                )
             )
         if daily.empty:
             daily, _ = _fetch_chart_data(cand, chart_range, "1d")
             daily = _normalize_ohlc_df(daily)
         if not daily.empty:
-            rule = "W-FRI" if interval == "1wk" else "ME"
+            rule = "W-FRI" if requested_interval == "1wk" else "ME"
             hist = _resample_ohlc(daily, rule)
 
     if hist.empty:
-        hist, _ = _fetch_chart_data(cand, chart_range, interval)
+        hist, _ = _fetch_chart_data(cand, chart_range, provider_interval)
         hist = _normalize_ohlc_df(hist)
+
+    if requested_interval == "240m" and not hist.empty:
+        hist = _resample_ohlc_by_bar_count(hist, bars_per_bucket=4)
 
     return hist
 
-def _fetch_chart_data(ticker, range_str="5d", interval="1d"):
+def _fetch_chart_data(ticker, range_str="5d", interval="1d", auto_adjust=False):
     try:
         encoded = urllib.parse.quote(ticker)
         url = (
@@ -908,18 +1555,2102 @@ def _fetch_chart_data(ticker, range_str="5d", interval="1d"):
         return pd.DataFrame(), r0.get("meta", {}) or {}
 
     q0 = quotes[0]
+
+    def quote_series(key):
+        values = q0.get(key)
+        if not isinstance(values, list) or len(values) != len(timestamps):
+            values = [np.nan] * len(timestamps)
+        return pd.Series(values, dtype="float64")
+
+    close_values = quote_series("close")
+    open_values = quote_series("open")
+    high_values = quote_series("high")
+    low_values = quote_series("low")
+    volume_values = quote_series("volume")
+    adj_groups = r0.get("indicators", {}).get("adjclose", [])
+    adjusted_values = (
+        pd.Series(adj_groups[0].get("adjclose"), dtype="float64")
+        if adj_groups
+        and isinstance(adj_groups[0], dict)
+        and isinstance(adj_groups[0].get("adjclose"), list)
+        else pd.Series(np.nan, index=range(len(timestamps)), dtype="float64")
+    )
+    if len(adjusted_values) != len(close_values):
+        adjusted_values = pd.Series(
+            np.nan,
+            index=range(len(timestamps)),
+            dtype="float64",
+        )
+
+    if auto_adjust and adjusted_values.notna().any():
+        if len(adjusted_values) == len(close_values):
+            effective_adjusted_values = adjusted_values.combine_first(close_values)
+            factor = effective_adjusted_values / close_values.replace(0, np.nan)
+            open_values = open_values * factor
+            high_values = high_values * factor
+            low_values = low_values * factor
+            close_values = effective_adjusted_values
+
+    timestamp_positions = {}
+    normalized_date_positions = {}
+    for position, raw_timestamp in enumerate(timestamps):
+        try:
+            numeric_timestamp = int(raw_timestamp)
+        except (TypeError, ValueError):
+            continue
+        timestamp_positions.setdefault(numeric_timestamp, position)
+        normalized_date = pd.Timestamp(numeric_timestamp, unit="s").normalize()
+        normalized_date_positions.setdefault(normalized_date, position)
+
+    def event_position(event_key, event):
+        event_data = event if isinstance(event, dict) else {}
+        raw_timestamp = event_data.get("date", event_key)
+        try:
+            numeric_timestamp = int(raw_timestamp)
+        except (TypeError, ValueError):
+            return None
+        exact_position = timestamp_positions.get(numeric_timestamp)
+        if exact_position is not None:
+            return exact_position
+        return normalized_date_positions.get(
+            pd.Timestamp(numeric_timestamp, unit="s").normalize()
+        )
+
+    dividends = np.zeros(len(timestamps), dtype="float64")
+    stock_splits = np.zeros(len(timestamps), dtype="float64")
+    events = r0.get("events") or {}
+    dividend_events = events.get("dividends") or {}
+    if isinstance(dividend_events, dict):
+        for event_key, event in dividend_events.items():
+            position = event_position(event_key, event)
+            event_data = event if isinstance(event, dict) else {}
+            amount = _financial_number(event_data.get("amount"))
+            if position is not None and amount is not None:
+                dividends[position] += amount
+
+    split_events = events.get("splits") or {}
+    if isinstance(split_events, dict):
+        for event_key, event in split_events.items():
+            position = event_position(event_key, event)
+            event_data = event if isinstance(event, dict) else {}
+            numerator = _financial_number(event_data.get("numerator"))
+            denominator = _financial_number(event_data.get("denominator"))
+            split_ratio = None
+            if numerator is not None and denominator not in (None, 0):
+                split_ratio = numerator / denominator
+            if split_ratio is None:
+                ratio_text = str(event_data.get("splitRatio") or "")
+                ratio_parts = ratio_text.split(":", 1)
+                if len(ratio_parts) == 2:
+                    ratio_numerator = _financial_number(ratio_parts[0])
+                    ratio_denominator = _financial_number(ratio_parts[1])
+                    if ratio_numerator is not None and ratio_denominator not in (None, 0):
+                        split_ratio = ratio_numerator / ratio_denominator
+            if position is not None and split_ratio is not None:
+                stock_splits[position] = (
+                    split_ratio
+                    if stock_splits[position] == 0
+                    else stock_splits[position] * split_ratio
+                )
+
     df = pd.DataFrame(
         {
-            "Open": q0.get("open"),
-            "High": q0.get("high"),
-            "Low": q0.get("low"),
-            "Close": q0.get("close"),
-            "Volume": q0.get("volume"),
+            "Open": open_values.to_numpy(),
+            "High": high_values.to_numpy(),
+            "Low": low_values.to_numpy(),
+            "Close": close_values.to_numpy(),
+            "Adj Close": adjusted_values.to_numpy(),
+            "Volume": volume_values.to_numpy(),
+            "Dividends": dividends,
+            "Stock Splits": stock_splits,
         },
         index=pd.to_datetime(timestamps, unit="s"),
     )
+    original_row_count = len(df)
     df = df.dropna(subset=["Close"])
+    df.attrs["invalidRowsRemoved"] = max(original_row_count - len(df), 0)
+    # Preserve the source timestamp convention for consumers needing local
+    # session dates (FX midnight London is the previous UTC date in summer).
+    df.attrs["timestampTimezone"] = "UTC"
+    df.attrs["exchangeTimezoneName"] = (r0.get("meta") or {}).get("exchangeTimezoneName")
     return df, r0.get("meta", {}) or {}
+
+
+def _fetch_analytics_history(ticker, stock, period="6y", auto_adjust=True):
+    history = _normalize_ohlc_df(
+        safe_history(
+            stock,
+            period=period,
+            interval="1d",
+            auto_adjust=auto_adjust,
+        )
+    )
+    if history.empty:
+        history = _normalize_ohlc_df(
+            safe_download(
+                ticker,
+                period=period,
+                interval="1d",
+                auto_adjust=auto_adjust,
+                progress=False,
+                threads=False,
+            )
+        )
+    if history.empty:
+        history, _ = _fetch_chart_data(
+            ticker,
+            "10y",
+            "1d",
+            auto_adjust=auto_adjust,
+        )
+        history = _normalize_ohlc_df(history)
+    if history.empty or "Close" not in history.columns:
+        return pd.DataFrame()
+
+    history["Close"] = pd.to_numeric(history["Close"], errors="coerce")
+    history = history.dropna(subset=["Close"])
+    if not history.empty and isinstance(history.index, pd.DatetimeIndex):
+        try:
+            years = int(str(period).removesuffix("y"))
+            cutoff = history.index[-1] - pd.DateOffset(years=years)
+            history = history[history.index >= cutoff]
+        except (TypeError, ValueError):
+            pass
+    return history
+
+
+def _benchmark_for_ticker(ticker):
+    symbol = (ticker or "").upper()
+    suffix_map = {
+        ".MI": "FTSEMIB.MI",
+        ".DE": "^GDAXI",
+        ".F": "^GDAXI",
+        ".L": "^FTSE",
+        ".PA": "^FCHI",
+        ".AS": "^AEX",
+        ".SW": "^SSMI",
+        ".TO": "^GSPTSE",
+        ".V": "^GSPTSE",
+        ".HK": "^HSI",
+        ".T": "^N225",
+        ".AX": "^AXJO",
+    }
+    for suffix, benchmark in suffix_map.items():
+        if symbol.endswith(suffix):
+            return benchmark
+    return "^GSPC"
+
+
+SEC_COMPANYFACTS_CONCEPTS = {
+    # Conto economico
+    "TotalRevenue": (
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "Revenues",
+        "SalesRevenueNet",
+    ),
+    "CostOfRevenue": (
+        "CostOfRevenue",
+        "CostOfGoodsAndServicesSold",
+        "CostOfGoodsSold",
+    ),
+    "GrossProfit": ("GrossProfit",),
+    "OperatingExpense": ("OperatingExpenses",),
+    "SellingGeneralAndAdministration": (
+        "SellingGeneralAndAdministrativeExpense",
+    ),
+    "ResearchAndDevelopment": (
+        "ResearchAndDevelopmentExpense",
+        "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost",
+    ),
+    "OperatingIncome": ("OperatingIncomeLoss",),
+    "NetNonOperatingInterestIncomeExpense": (
+        "InterestIncomeExpenseNonoperatingNet",
+    ),
+    "OtherIncomeExpense": (
+        "NonoperatingIncomeExpense",
+        "OtherNonoperatingIncomeExpense",
+    ),
+    "PretaxIncome": (
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
+    ),
+    "TaxProvision": ("IncomeTaxExpenseBenefit",),
+    "NetIncomeCommonStockholders": (
+        "NetIncomeLossAvailableToCommonStockholdersBasic",
+        "NetIncomeLoss",
+        "ProfitLoss",
+    ),
+    "BasicEPS": ("EarningsPerShareBasic",),
+    "DilutedEPS": ("EarningsPerShareDiluted",),
+    "BasicAverageShares": ("WeightedAverageNumberOfSharesOutstandingBasic",),
+    "DilutedAverageShares": (
+        "WeightedAverageNumberOfDilutedSharesOutstanding",
+    ),
+    "TotalExpenses": ("CostsAndExpenses",),
+    "InterestIncome": (
+        "InterestIncomeNonoperating",
+        "InvestmentIncomeInterest",
+    ),
+    "InterestExpense": (
+        "InterestExpenseNonOperating",
+        "InterestExpense",
+    ),
+    # Stato patrimoniale
+    "TotalAssets": ("Assets",),
+    "CurrentAssets": ("AssetsCurrent",),
+    "CashCashEquivalentsAndShortTermInvestments": (
+        "CashCashEquivalentsAndShortTermInvestments",
+    ),
+    "CashAndCashEquivalents": (
+        "CashAndCashEquivalentsAtCarryingValue",
+        "Cash",
+    ),
+    "OtherShortTermInvestments": (
+        "ShortTermInvestments",
+        "MarketableSecuritiesCurrent",
+    ),
+    "AccountsReceivable": (
+        "AccountsReceivableNetCurrent",
+        "AccountsNotesAndLoansReceivableNetCurrent",
+    ),
+    "Inventory": ("InventoryNet",),
+    "TotalNonCurrentAssets": ("AssetsNoncurrent",),
+    "NetPPE": ("PropertyPlantAndEquipmentNet",),
+    "GoodwillAndOtherIntangibleAssets": (
+        "GoodwillAndIntangibleAssetsNet",
+    ),
+    "Goodwill": ("Goodwill",),
+    "TotalLiabilitiesNetMinorityInterest": ("Liabilities",),
+    "CurrentLiabilities": ("LiabilitiesCurrent",),
+    "AccountsPayable": (
+        "AccountsPayableCurrent",
+        "AccountsPayableAndAccruedLiabilitiesCurrent",
+    ),
+    "CurrentDebt": (
+        "LongTermDebtCurrent",
+        "ShortTermBorrowings",
+        "ShortTermDebtCurrent",
+        "LongTermDebtAndFinanceLeaseObligationsCurrent",
+    ),
+    "TotalNonCurrentLiabilitiesNetMinorityInterest": (
+        "LiabilitiesNoncurrent",
+    ),
+    "LongTermDebt": (
+        "LongTermDebtNoncurrent",
+        "LongTermDebtAndFinanceLeaseObligationsNoncurrent",
+    ),
+    "TotalDebt": (
+        "LongTermDebtAndFinanceLeaseObligations",
+        "LongTermDebtAndCapitalLeaseObligations",
+    ),
+    "StockholdersEquity": (
+        "StockholdersEquity",
+        "CommonStockholdersEquity",
+    ),
+    "TotalEquityGrossMinorityInterest": (
+        "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+    ),
+    "OrdinarySharesNumber": ("CommonStockSharesOutstanding",),
+    # Rendiconto finanziario
+    "OperatingCashFlow": ("NetCashProvidedByUsedInOperatingActivities",),
+    "InvestingCashFlow": ("NetCashProvidedByUsedInInvestingActivities",),
+    "FinancingCashFlow": ("NetCashProvidedByUsedInFinancingActivities",),
+    "EndCashPosition": (
+        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+        "CashAndCashEquivalentsAtCarryingValue",
+    ),
+    "IncomeTaxPaidSupplementalData": (
+        "IncomeTaxesPaidNet",
+        "IncomeTaxesPaid",
+    ),
+    "InterestPaidSupplementalData": (
+        "InterestPaidNet",
+        "InterestPaid",
+    ),
+    "CapitalExpenditure": (
+        "PaymentsToAcquirePropertyPlantAndEquipment",
+        "PaymentsToAcquireProductiveAssets",
+    ),
+    "PurchaseOfBusiness": (
+        "PaymentsToAcquireBusinessesNetOfCashAcquired",
+        "PaymentsToAcquireBusinessesGross",
+    ),
+    "IssuanceOfDebt": (
+        "ProceedsFromIssuanceOfDebt",
+        "ProceedsFromIssuanceOfLongTermDebt",
+    ),
+    "RepaymentOfDebt": (
+        "RepaymentsOfDebt",
+        "RepaymentsOfLongTermDebt",
+    ),
+    "IssuanceOfCapitalStock": (
+        "ProceedsFromIssuanceOfCommonStock",
+        "ProceedsFromStockOptionsExercised",
+    ),
+    "RepurchaseOfCapitalStock": (
+        "PaymentsForRepurchaseOfCommonStock",
+        "PaymentsForRepurchaseOfEquity",
+    ),
+    "CashDividendsPaid": (
+        "PaymentsOfDividends",
+        "PaymentsOfDividendsCommonStock",
+    ),
+    "ChangeInWorkingCapital": ("IncreaseDecreaseInOperatingCapital",),
+    "ChangeInInventory": ("IncreaseDecreaseInInventories",),
+    "ChangeInReceivables": (
+        "IncreaseDecreaseInAccountsReceivable",
+        "IncreaseDecreaseInAccountsAndNotesReceivable",
+    ),
+    "ChangeInPayable": (
+        "IncreaseDecreaseInAccountsPayableAndAccruedLiabilities",
+        "IncreaseDecreaseInAccountsPayable",
+    ),
+    "StockBasedCompensation": (
+        "ShareBasedCompensation",
+        "AllocatedShareBasedCompensationExpense",
+    ),
+    "DepreciationAndAmortization": (
+        "DepreciationDepletionAndAmortization",
+        "DepreciationDepletionAndAmortizationPropertyPlantAndEquipment",
+    ),
+    "NetIncomeFromContinuingOperations": (
+        "NetIncomeLoss",
+        "ProfitLoss",
+    ),
+}
+
+SEC_ANNUAL_FORMS = {
+    "10-K",
+    "10-K/A",
+    "20-F",
+    "20-F/A",
+    "40-F",
+    "40-F/A",
+}
+SEC_NEGATIVE_CASH_FLOW_METRICS = {
+    "CapitalExpenditure",
+    "PurchaseOfBusiness",
+    "RepaymentOfDebt",
+    "RepurchaseOfCapitalStock",
+    "CashDividendsPaid",
+}
+SEC_PER_SHARE_METRICS = {"BasicEPS", "DilutedEPS"}
+SEC_SHARE_METRICS = {
+    "BasicAverageShares",
+    "DilutedAverageShares",
+    "OrdinarySharesNumber",
+}
+SEC_INSTANT_METRICS = {
+    row["key"]
+    for row in FINANCIAL_STATEMENT_CONFIG["balance"]["rows"]
+} | {
+    "EndCashPosition",
+    "Goodwill",
+    "OtherShortTermInvestments",
+}
+
+
+def _sec_request_json(url, timeout=15):
+    """Scarica JSON SEC con un User-Agent identificabile e configurabile."""
+    user_agent = (
+        os.environ.get("SEC_USER_AGENT")
+        or "StockApp/1.0 (local financial research; configure SEC_USER_AGENT)"
+    ).strip()
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": user_agent,
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        raw_payload = response.read()
+        if str(response.headers.get("Content-Encoding") or "").lower() == "gzip":
+            raw_payload = gzip.decompress(raw_payload)
+    return json.loads(raw_payload.decode("utf-8"))
+
+
+def _read_fundamental_training_cache_json(*parts):
+    """Legge solo i file SEC già acquisiti dal trainer, se disponibili."""
+
+    path = os.path.abspath(
+        os.path.join(FUNDAMENTAL_TRAINING_CACHE_DIR, *parts)
+    )
+    cache_root = os.path.abspath(FUNDAMENTAL_TRAINING_CACHE_DIR)
+    try:
+        if os.path.commonpath([path, cache_root]) != cache_root:
+            return {}
+        with open(path, "r", encoding="utf-8") as cache_file:
+            payload = json.load(cache_file)
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _resolve_sec_cik_from_training_cache(ticker):
+    symbol = _normalized_sec_ticker(ticker)
+    cached = _cache_get(
+        sec_reference_cache,
+        "training_company_tickers",
+        SEC_REFERENCE_CACHE_TTL,
+    )
+    if isinstance(cached, dict):
+        return cached.get(symbol)
+    payload = _read_fundamental_training_cache_json("company_tickers.json")
+    lookup = {}
+    for entry in payload.values():
+        if not isinstance(entry, dict):
+            continue
+        cached_symbol = _normalized_sec_ticker(entry.get("ticker"))
+        try:
+            cik = int(entry.get("cik_str"))
+        except (TypeError, ValueError):
+            continue
+        if cached_symbol and cik > 0:
+            lookup[cached_symbol] = cik
+    _cache_set(
+        sec_reference_cache,
+        "training_company_tickers",
+        lookup,
+        max_size=4,
+    )
+    return lookup.get(symbol)
+
+
+def _latest_fundamental_training_price(ticker):
+    """Fallback locale: ultima chiusura grezza e relativa data."""
+
+    symbol = re.sub(r"[^A-Z0-9._-]", "", str(ticker or "").upper())
+    if not symbol:
+        return None, None
+    path = os.path.abspath(
+        os.path.join(FUNDAMENTAL_TRAINING_CACHE_DIR, "prices", f"{symbol}.csv")
+    )
+    cache_root = os.path.abspath(FUNDAMENTAL_TRAINING_CACHE_DIR)
+    try:
+        if os.path.commonpath([path, cache_root]) != cache_root:
+            return None, None
+        frame = pd.read_csv(path, index_col=0)
+    except (OSError, ValueError):
+        return None, None
+    if frame.empty or "Close" not in frame.columns:
+        return None, None
+    close = pd.to_numeric(frame["Close"], errors="coerce").dropna()
+    if close.empty:
+        return None, None
+    latest_index = close.index[-1]
+    try:
+        price_as_of = pd.Timestamp(latest_index).date().isoformat()
+    except (TypeError, ValueError):
+        price_as_of = str(latest_index)[:10] or None
+    return float(close.iloc[-1]), price_as_of
+
+
+def _sec_ticker_lookup():
+    cached = _cache_get_adaptive(
+        sec_reference_cache,
+        "company_tickers",
+        SEC_REFERENCE_CACHE_TTL,
+    )
+    if cached is not None:
+        return cached
+
+    try:
+        payload = _sec_request_json(
+            "https://www.sec.gov/files/company_tickers.json",
+        )
+        entries = payload.values() if isinstance(payload, dict) else []
+        lookup = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            ticker = str(entry.get("ticker") or "").strip().upper()
+            try:
+                cik = int(entry.get("cik_str"))
+            except (TypeError, ValueError):
+                continue
+            if not ticker or cik <= 0:
+                continue
+            lookup[ticker] = cik
+            lookup[ticker.replace(".", "-")] = cik
+    except Exception:
+        lookup = {}
+
+    _cache_set(sec_reference_cache, "company_tickers", lookup, max_size=4)
+    return lookup
+
+
+SEC_EFTS_DISPLAY_NAME_PATTERN = re.compile(
+    r"\(\s*"
+    r"(?P<tickers>[A-Z0-9][A-Z0-9.\-]*"
+    r"(?:\s*,\s*[A-Z0-9][A-Z0-9.\-]*)*)"
+    r"\s*\)\s*"
+    r"\(CIK\s+(?P<cik>\d{1,10})\)",
+    re.IGNORECASE,
+)
+
+
+def _normalized_sec_ticker(value):
+    return str(value or "").strip().upper().replace(".", "-")
+
+
+def _extract_sec_cik_from_efts(payload, ticker):
+    """Estrae il CIK solo da un ticker esatto nel gruppo tra parentesi."""
+    expected = _normalized_sec_ticker(ticker)
+    if not expected or not isinstance(payload, dict):
+        return None
+
+    display_names = []
+    hits = payload.get("hits")
+    hit_rows = hits.get("hits") if isinstance(hits, dict) else None
+    if isinstance(hit_rows, list):
+        for hit in hit_rows:
+            source = hit.get("_source") if isinstance(hit, dict) else None
+            names = source.get("display_names") if isinstance(source, dict) else None
+            if isinstance(names, list):
+                display_names.extend(names)
+            elif isinstance(names, str):
+                display_names.append(names)
+
+    aggregations = payload.get("aggregations")
+    entity_filter = (
+        aggregations.get("entity_filter")
+        if isinstance(aggregations, dict)
+        else None
+    )
+    buckets = entity_filter.get("buckets") if isinstance(entity_filter, dict) else None
+    if isinstance(buckets, list):
+        for bucket in buckets:
+            if isinstance(bucket, dict) and isinstance(bucket.get("key"), str):
+                display_names.append(bucket["key"])
+
+    for display_name in display_names:
+        if not isinstance(display_name, str):
+            continue
+        for match in SEC_EFTS_DISPLAY_NAME_PATTERN.finditer(display_name):
+            ticker_tokens = {
+                _normalized_sec_ticker(token)
+                for token in match.group("tickers").split(",")
+            }
+            if expected not in ticker_tokens:
+                continue
+            try:
+                cik = int(match.group("cik"))
+            except (TypeError, ValueError):
+                continue
+            if cik > 0:
+                return cik
+    return None
+
+
+def _resolve_sec_cik_via_efts(ticker):
+    symbol = _normalized_sec_ticker(ticker)
+    cache_key = f"efts_cik:{symbol}"
+    cached = _cache_get_adaptive(
+        sec_reference_cache,
+        cache_key,
+        SEC_REFERENCE_CACHE_TTL,
+        is_negative=lambda value: (
+            not isinstance(value, dict) or value.get("cik") is None
+        ),
+    )
+    if isinstance(cached, dict):
+        return cached.get("cik")
+
+    cik = None
+    try:
+        query = urllib.parse.urlencode(
+            {
+                "q": symbol,
+                "from": 0,
+                "size": 100,
+            }
+        )
+        payload = _sec_request_json(
+            f"https://efts.sec.gov/LATEST/search-index?{query}",
+        )
+        cik = _extract_sec_cik_from_efts(payload, symbol)
+    except Exception:
+        cik = None
+
+    # Anche l'esito negativo viene memorizzato: un EFTS indisponibile non deve
+    # rallentare ripetutamente le richieste dello stesso ticker.
+    _cache_set(
+        sec_reference_cache,
+        cache_key,
+        {"cik": cik},
+        max_size=1000,
+    )
+    return cik
+
+
+def _resolve_sec_cik(ticker):
+    symbol = str(ticker or "").strip().upper()
+    if not symbol or any(marker in symbol for marker in ("^", "=", "/", "\\")):
+        return None
+    symbol = _normalized_sec_ticker(symbol.split(":")[-1])
+    primary_cik = _sec_ticker_lookup().get(symbol)
+    if primary_cik is not None:
+        return primary_cik
+    cached_training_cik = _resolve_sec_cik_from_training_cache(symbol)
+    if cached_training_cik is not None:
+        return cached_training_cik
+    return _resolve_sec_cik_via_efts(symbol)
+
+
+def _fetch_sec_companyfacts_payload(ticker):
+    cik = _resolve_sec_cik(ticker)
+    if cik is None:
+        return {}
+
+    cache_key = f"{int(cik):010d}"
+    cached = _cache_get_adaptive(
+        sec_companyfacts_cache,
+        cache_key,
+        SEC_COMPANYFACTS_CACHE_TTL,
+    )
+    if cached is not None:
+        return cached
+
+    try:
+        payload = _sec_request_json(
+            f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cache_key}.json",
+        )
+        if not isinstance(payload, dict):
+            payload = {}
+    except Exception:
+        payload = {}
+    if not payload:
+        payload = _read_fundamental_training_cache_json(
+            "sec",
+            cache_key,
+            "companyfacts.json",
+        )
+
+    _cache_set(sec_companyfacts_cache, cache_key, payload, max_size=320)
+    return payload
+
+
+def _fetch_sec_submissions_payload(ticker):
+    """Restituisce il payload SEC grezzo richiesto dalla pipeline ML.
+
+    È tenuto separato da ``_fetch_sec_filings`` perché la vista utente limita
+    intenzionalmente il numero di filing, mentre l'inferenza deve conservare
+    accession e data/ora di accettazione.
+    """
+
+    cik = _resolve_sec_cik(ticker)
+    if cik is None:
+        return {}
+    cache_key = f"{int(cik):010d}"
+    cached = _cache_get_adaptive(
+        sec_submissions_cache,
+        cache_key,
+        SEC_FILINGS_CACHE_TTL,
+    )
+    if cached is not None:
+        return cached
+    try:
+        payload = _sec_request_json(
+            f"https://data.sec.gov/submissions/CIK{cache_key}.json",
+            timeout=10,
+        )
+        if not isinstance(payload, dict):
+            payload = {}
+    except Exception:
+        payload = {}
+    if not payload:
+        payload = _read_fundamental_training_cache_json(
+            "sec",
+            cache_key,
+            "submissions.json",
+        )
+    _cache_set(sec_submissions_cache, cache_key, payload, max_size=320)
+    return payload
+
+
+def _load_fundamental_model_artifact():
+    """Carica l'artifact JSON e lo aggiorna soltanto quando cambia su disco."""
+
+    model_path = os.path.abspath(FUNDAMENTAL_MODEL_PATH)
+    try:
+        modified_at = os.path.getmtime(model_path)
+    except OSError:
+        return None
+
+    if (
+        _fundamental_model_state.get("path") == model_path
+        and _fundamental_model_state.get("mtime") == modified_at
+        and isinstance(_fundamental_model_state.get("artifact"), dict)
+    ):
+        return _fundamental_model_state["artifact"]
+
+    try:
+        with open(model_path, "r", encoding="utf-8") as model_file:
+            artifact = json.load(model_file)
+    except (OSError, ValueError):
+        return None
+    if (
+        not isinstance(artifact, dict)
+        or not isinstance(artifact.get("models"), dict)
+        or not artifact.get("models")
+    ):
+        return None
+    artifact_changed = (
+        _fundamental_model_state.get("path") != model_path
+        or _fundamental_model_state.get("mtime") != modified_at
+    )
+    _fundamental_model_state.update(
+        {
+            "path": model_path,
+            "mtime": modified_at,
+            "artifact": artifact,
+        }
+    )
+    if artifact_changed:
+        fundamental_forecast_cache.clear()
+    return artifact
+
+
+def _fundamental_model_ood(features, artifact):
+    """Aggrega i limiti 1/99 dei tre orizzonti senza bloccare l'inferenza."""
+
+    models = artifact.get("models") if isinstance(artifact, dict) else None
+    if not isinstance(models, dict) or not models:
+        return []
+    warnings = set()
+    for model in models.values():
+        preprocessing = (
+            model.get("preprocessing")
+            if isinstance(model, dict)
+            else None
+        )
+        if not isinstance(preprocessing, dict):
+            continue
+        names = preprocessing.get("featureNames") or []
+        lower = preprocessing.get("lowerBounds") or []
+        upper = preprocessing.get("upperBounds") or []
+        for index, name in enumerate(names):
+            if index >= len(lower) or index >= len(upper):
+                continue
+            value = _financial_number(features.get(name))
+            if value is None:
+                continue
+            if value < lower[index] or value > upper[index]:
+                warnings.add(name)
+    return sorted(warnings)
+
+
+def _fundamental_artifact_feature_names(artifact):
+    """Raccoglie gli schemi globali e per-modello degli artifact v3-v5."""
+
+    names = []
+    seen = set()
+
+    def add(value):
+        if not isinstance(value, str):
+            return
+        name = value.strip()
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+
+    def visit(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key == "featureNames" and isinstance(child, (list, tuple)):
+                    for feature_name in child:
+                        add(feature_name)
+                elif isinstance(child, (dict, list, tuple)):
+                    visit(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                if isinstance(child, (dict, list, tuple)):
+                    visit(child)
+
+    visit(artifact if isinstance(artifact, dict) else {})
+    return names
+
+
+def _artifact_v5_feature_requirements(artifact):
+    required = set(_fundamental_artifact_feature_names(artifact))
+    market_names = set(V5_MARKET_FEATURE_NAMES) | set(
+        V5_MARKET_MISSING_FLAG_NAMES
+    )
+    categorical_names = set(V5_CATEGORICAL_FEATURE_NAMES)
+    return {
+        "required": required,
+        "market": sorted(required & market_names),
+        "categorical": sorted(required & categorical_names),
+    }
+
+
+def _runtime_security_alias_row(alias, issuer):
+    if not isinstance(alias, dict):
+        return None
+    return {
+        "security_id": issuer.get("securityId"),
+        "ticker": alias.get("ticker"),
+        "canonical_ticker": issuer.get("canonicalTicker"),
+        "price_ticker": alias.get("priceTicker") or alias.get("ticker"),
+        "valid_from": alias.get("validFrom"),
+        "valid_to": alias.get("validTo"),
+        "delist_date": alias.get("delistDate"),
+        "delisting_return": alias.get("delistingReturn"),
+        "sector": alias.get("sector"),
+        "industry": alias.get("industry"),
+        "sic": alias.get("sic"),
+        "exchange": alias.get("exchange"),
+        "security_type": alias.get("securityType"),
+        "sector_benchmark": alias.get("sectorBenchmark"),
+        "cik": alias.get("cik"),
+        "current_ticker": issuer.get("currentTicker"),
+    }
+
+
+def _resolve_artifact_security(artifact, ticker, as_of):
+    """Risolve ticker/alias sul security master portabile incorporato nel modello."""
+
+    dataset = artifact.get("dataset", {}) if isinstance(artifact, dict) else {}
+    runtime = (
+        dataset.get("securityMasterRuntime")
+        if isinstance(dataset, dict)
+        else None
+    )
+    if not isinstance(runtime, dict):
+        return None, False
+    issuers = runtime.get("issuers")
+    if not isinstance(issuers, list):
+        return None, True
+
+    symbol = str(ticker or "").strip().upper()
+    for issuer in issuers:
+        if not isinstance(issuer, dict):
+            continue
+        aliases = issuer.get("aliases") or []
+        identity_symbols = {
+            str(issuer.get("canonicalTicker") or "").strip().upper(),
+            str(issuer.get("currentTicker") or "").strip().upper(),
+        }
+        for alias in aliases:
+            if not isinstance(alias, dict):
+                continue
+            identity_symbols.add(str(alias.get("ticker") or "").strip().upper())
+            identity_symbols.add(
+                str(alias.get("priceTicker") or "").strip().upper()
+            )
+        if symbol not in identity_symbols:
+            continue
+        timeline = [
+            row
+            for row in (
+                _runtime_security_alias_row(alias, issuer) for alias in aliases
+            )
+            if row is not None
+        ]
+        resolved = resolve_security_point_in_time(timeline, as_of)
+        return resolved, True
+    return None, True
+
+
+def _fundamental_market_benchmark(target_policy, security_row, ticker):
+    benchmarks = (
+        target_policy.get("benchmarks", {})
+        if isinstance(target_policy, dict)
+        else {}
+    )
+    if not isinstance(benchmarks, dict):
+        benchmarks = {}
+    raw_market = (
+        benchmarks.get("market")
+        or benchmarks.get("marketBenchmark")
+        or benchmarks.get("market_benchmark")
+    )
+    if isinstance(raw_market, dict):
+        raw_market = raw_market.get("ticker") or raw_market.get("symbol")
+    if raw_market:
+        return str(raw_market).strip().upper()
+
+    # Il default US e un ETF negoziabile/total-return; per gli altri mercati
+    # conserva il benchmark geografico gia usato dall'app.
+    symbol = str(ticker or "").upper()
+    if not any(symbol.endswith(suffix) for suffix in (
+        ".MI", ".DE", ".F", ".L", ".PA", ".AS", ".SW", ".TO",
+        ".V", ".HK", ".T", ".AX",
+    )):
+        return "SPY"
+    return _benchmark_for_ticker(symbol)
+
+
+def _fetch_live_earnings_events(stock, snapshot_at):
+    """Converte il calendario Yahoo in record con disponibilita esplicita."""
+
+    try:
+        frame = stock.get_earnings_dates(limit=16)
+    except Exception:
+        return []
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return []
+
+    snapshot = pd.Timestamp(snapshot_at)
+    if snapshot.tzinfo is not None:
+        snapshot = snapshot.tz_convert("UTC").tz_localize(None)
+    records = []
+    for index, row in frame.iterrows():
+        try:
+            event_at = pd.Timestamp(index)
+            if event_at.tzinfo is not None:
+                event_at = event_at.tz_convert("UTC").tz_localize(None)
+        except (TypeError, ValueError):
+            continue
+        record = {"event_date": event_at.isoformat()}
+        if event_at <= snapshot:
+            # Per un evento trascorso la data/ora riportata e il primo cutoff
+            # conservativo utilizzabile; nessuna surprise futura viene inclusa.
+            record["published_at"] = event_at.isoformat()
+            for column in ("Surprise(%)", "Surprise (%)", "surprisePercent"):
+                surprise = _financial_number(row.get(column))
+                if surprise is not None:
+                    record["earnings_surprise_pct"] = surprise
+                    break
+            actual = _financial_number(
+                row.get("Reported EPS", row.get("reportedEPS"))
+            )
+            estimate = _financial_number(
+                row.get("EPS Estimate", row.get("epsEstimate"))
+            )
+            if actual is not None:
+                record["actual_eps"] = actual
+            if estimate is not None:
+                record["estimate_eps"] = estimate
+        else:
+            # Il calendario e stato osservato adesso: questo timestamp prova
+            # soltanto la disponibilita corrente, non una conoscenza storica.
+            record["announced_at"] = snapshot.isoformat()
+        records.append(record)
+    return records
+
+
+def _build_runtime_v5_features(
+    artifact,
+    ticker,
+    quote_fields,
+    chart_meta,
+    submissions,
+    security_row,
+    snapshot_at,
+):
+    requirements = _artifact_v5_feature_requirements(artifact)
+    output = {}
+    audit = {
+        "enabled": bool(requirements["market"] or requirements["categorical"]),
+        "requiredMarketFeatures": requirements["market"],
+        "requiredCategoricalFeatures": requirements["categorical"],
+        "marketBenchmark": None,
+        "marketFeatureCutoffDate": None,
+        "earningsFeatureCutoffAt": None,
+        "futureSourceRecordsRejected": 0,
+        "missingRequiredFeatures": [],
+    }
+    if not audit["enabled"]:
+        return output, audit
+
+    if requirements["market"]:
+        stock = yf.Ticker(ticker)
+        stock_history = _fetch_analytics_history(
+            ticker,
+            stock,
+            period="2y",
+            auto_adjust=False,
+        )
+        target_policy = (artifact.get("dataset", {}) or {}).get(
+            "targetPolicy", {}
+        )
+        benchmark_symbol = _fundamental_market_benchmark(
+            target_policy,
+            security_row,
+            ticker,
+        )
+        benchmark_history = _fetch_analytics_history(
+            benchmark_symbol,
+            yf.Ticker(benchmark_symbol),
+            period="2y",
+            auto_adjust=False,
+        )
+        live_events = _fetch_live_earnings_events(stock, snapshot_at)
+        market_features = build_market_event_features(
+            stock_history,
+            snapshot_at,
+            market_frame=benchmark_history,
+            shares_outstanding=quote_fields.get("sharesOutstanding"),
+            earnings_events=live_events,
+            # Nessuna revisione viene usata senza una sorgente timestamped.
+            estimate_revisions=[],
+        )
+        if market_features.get("feature_lookahead_detected"):
+            raise RuntimeError("Feature market/event con look-ahead rilevata.")
+        output.update(
+            {
+                name: market_features.get(name)
+                for name in (
+                    *V5_MARKET_FEATURE_NAMES,
+                    *V5_MARKET_MISSING_FLAG_NAMES,
+                )
+            }
+        )
+        audit.update(
+            {
+                "marketBenchmark": benchmark_symbol,
+                "marketFeatureCutoffDate": market_features.get(
+                    "market_feature_cutoff_date"
+                ),
+                "earningsFeatureCutoffAt": market_features.get(
+                    "earnings_feature_cutoff_at"
+                ),
+                "futureSourceRecordsRejected": market_features.get(
+                    "future_source_records_rejected", 0
+                ),
+            }
+        )
+
+    if requirements["categorical"]:
+        row = security_row or {}
+        categorical_values = {
+            "security_sector": row.get("sector") or quote_fields.get("sector"),
+            "security_sic": row.get("sic") or submissions.get("sic"),
+            "security_industry": (
+                row.get("industry")
+                or quote_fields.get("industry")
+                or submissions.get("sicDescription")
+            ),
+            "security_exchange": (
+                row.get("exchange")
+                or chart_meta.get("fullExchangeName")
+                or chart_meta.get("exchangeName")
+                or quote_fields.get("exchange")
+            ),
+            "security_type": (
+                row.get("security_type")
+                or chart_meta.get("instrumentType")
+                or quote_fields.get("quoteType")
+            ),
+        }
+        output.update(categorical_values)
+
+    audit["missingRequiredFeatures"] = sorted(
+        name
+        for name in requirements["market"] + requirements["categorical"]
+        if output.get(name) in (None, "")
+    )
+    return output, audit
+
+
+SEC_FILING_CATEGORIES = {
+    "annual": {
+        "forms": {"10-K", "10-K/A", "20-F", "20-F/A", "40-F", "40-F/A"},
+        "label": "Relazione annuale",
+        "limit": 3,
+    },
+    "quarterly": {
+        "forms": {"10-Q", "10-Q/A"},
+        "label": "Relazione trimestrale",
+        "limit": 4,
+    },
+    "current": {
+        "forms": {"8-K", "8-K/A", "6-K", "6-K/A"},
+        "label": "Aggiornamento rilevante",
+        "limit": 4,
+    },
+    "proxy": {
+        "forms": {"DEF 14A", "DEF 14C"},
+        "label": "Assemblea e governance",
+        "limit": 1,
+    },
+}
+
+
+def _parse_sec_submissions(payload):
+    """Converte il blocco ``filings.recent`` in link EDGAR verificabili."""
+    if not isinstance(payload, dict):
+        return {
+            "available": False,
+            "items": [],
+            "reason": "Risposta SEC non valida.",
+        }
+
+    try:
+        cik = int(payload.get("cik"))
+    except (TypeError, ValueError):
+        cik = None
+    if cik is None or cik <= 0:
+        return {
+            "available": False,
+            "items": [],
+            "reason": "CIK SEC non disponibile.",
+        }
+
+    filings = payload.get("filings")
+    recent = filings.get("recent") if isinstance(filings, dict) else None
+    if not isinstance(recent, dict):
+        recent = {}
+
+    forms = recent.get("form") if isinstance(recent.get("form"), list) else []
+    accessions = (
+        recent.get("accessionNumber")
+        if isinstance(recent.get("accessionNumber"), list)
+        else []
+    )
+    filing_dates = (
+        recent.get("filingDate")
+        if isinstance(recent.get("filingDate"), list)
+        else []
+    )
+    report_dates = (
+        recent.get("reportDate")
+        if isinstance(recent.get("reportDate"), list)
+        else []
+    )
+    accepted_dates = (
+        recent.get("acceptanceDateTime")
+        if isinstance(recent.get("acceptanceDateTime"), list)
+        else []
+    )
+    primary_documents = (
+        recent.get("primaryDocument")
+        if isinstance(recent.get("primaryDocument"), list)
+        else []
+    )
+    primary_descriptions = (
+        recent.get("primaryDocDescription")
+        if isinstance(recent.get("primaryDocDescription"), list)
+        else []
+    )
+
+    category_by_form = {
+        form: (category_key, category["label"])
+        for category_key, category in SEC_FILING_CATEGORIES.items()
+        for form in category["forms"]
+    }
+    category_items = {
+        category_key: []
+        for category_key in SEC_FILING_CATEGORIES
+    }
+
+    def list_value(values, index):
+        if index >= len(values):
+            return ""
+        return str(values[index] or "").strip()
+
+    for index, raw_form in enumerate(forms):
+        form = str(raw_form or "").strip().upper()
+        category = category_by_form.get(form)
+        if category is None:
+            continue
+
+        accession = list_value(accessions, index)
+        if not re.fullmatch(r"\d{10}-\d{2}-\d{6}", accession):
+            continue
+        accession_compact = accession.replace("-", "")
+        filing_date = list_value(filing_dates, index)
+        report_date = list_value(report_dates, index)
+        accepted_at = list_value(accepted_dates, index)
+        primary_document = list_value(primary_documents, index)
+        primary_description = list_value(primary_descriptions, index)
+        safe_primary_document = (
+            primary_document
+            if re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._-]*",
+                primary_document,
+            )
+            else ""
+        )
+
+        archive_root = (
+            f"https://www.sec.gov/Archives/edgar/data/"
+            f"{cik}/{accession_compact}"
+        )
+        category_key, category_label = category
+        category_items[category_key].append(
+            {
+                "form": form,
+                "category": category_key,
+                "categoryLabel": category_label,
+                "filingDate": filing_date or None,
+                "reportDate": report_date or None,
+                "acceptedAt": accepted_at or None,
+                "accessionNumber": accession,
+                "description": primary_description or category_label,
+                "filingUrl": f"{archive_root}/{accession}-index.html",
+                "documentUrl": (
+                    f"{archive_root}/{safe_primary_document}"
+                    if safe_primary_document
+                    else None
+                ),
+            }
+        )
+
+    selected = []
+    for category_key, category in SEC_FILING_CATEGORIES.items():
+        ordered = sorted(
+            category_items[category_key],
+            key=lambda item: (
+                item.get("filingDate") or "",
+                item.get("accessionNumber") or "",
+            ),
+            reverse=True,
+        )
+        selected.extend(ordered[: category["limit"]])
+
+    selected.sort(
+        key=lambda item: (
+            item.get("filingDate") or "",
+            item.get("accessionNumber") or "",
+        ),
+        reverse=True,
+    )
+    company_name = str(payload.get("name") or "").strip() or None
+    company_url = (
+        f"https://www.sec.gov/edgar/browse/?CIK={cik:010d}&owner=exclude"
+    )
+    return {
+        "available": bool(selected),
+        "provider": "SEC EDGAR",
+        "cik": f"{cik:010d}",
+        "companyName": company_name,
+        "companyUrl": company_url,
+        "items": selected,
+        "reason": (
+            None
+            if selected
+            else "Nessun filing finanziario recente disponibile su SEC EDGAR."
+        ),
+    }
+
+
+def _fetch_sec_filings(ticker):
+    cik = _resolve_sec_cik(ticker)
+    if cik is None:
+        return {
+            "available": False,
+            "provider": "SEC EDGAR",
+            "items": [],
+            "reason": "Il ticker non risulta associato a un emittente SEC.",
+        }
+
+    cache_key = f"{int(cik):010d}"
+    cached = _cache_get(
+        sec_filings_cache,
+        cache_key,
+        SEC_FILINGS_CACHE_TTL,
+    )
+    if cached is not None:
+        return cached
+
+    try:
+        payload = _sec_request_json(
+            f"https://data.sec.gov/submissions/CIK{cache_key}.json",
+            timeout=8,
+        )
+        parsed = _parse_sec_submissions(payload)
+    except Exception:
+        parsed = {
+            "available": False,
+            "provider": "SEC EDGAR",
+            "cik": cache_key,
+            "companyUrl": (
+                f"https://www.sec.gov/edgar/browse/"
+                f"?CIK={cache_key}&owner=exclude"
+            ),
+            "items": [],
+            "reason": "SEC EDGAR temporaneamente non raggiungibile.",
+        }
+
+    _cache_set(sec_filings_cache, cache_key, parsed, max_size=320)
+    return parsed
+
+
+def _sec_fact_entries(fact, metric_key):
+    units = fact.get("units") if isinstance(fact, dict) else None
+    if not isinstance(units, dict):
+        return []
+
+    if metric_key in SEC_PER_SHARE_METRICS:
+        preferred = [
+            key
+            for key in units
+            if "share" in key.lower() and "/" in key
+        ]
+    elif metric_key in SEC_SHARE_METRICS:
+        preferred = [
+            key
+            for key in units
+            if key.lower().replace(" ", "") in {"shares", "share"}
+        ]
+    else:
+        preferred = [
+            key
+            for key in units
+            if key == "USD"
+        ]
+        preferred.extend(
+            key
+            for key in units
+            if key not in preferred
+            and re.fullmatch(r"[A-Z]{3}", str(key))
+        )
+
+    for unit_key in preferred:
+        entries = units.get(unit_key)
+        if isinstance(entries, list):
+            return entries
+    return []
+
+
+def _parse_sec_annual_fact(fact, metric_key):
+    """Normalizza un fact us-gaap annuale e sceglie il filing più recente."""
+    selected = {}
+    is_instant = metric_key in SEC_INSTANT_METRICS
+
+    for entry in _sec_fact_entries(fact, metric_key):
+        if not isinstance(entry, dict):
+            continue
+        form = str(entry.get("form") or "").strip().upper()
+        fiscal_period = str(entry.get("fp") or "").strip().upper()
+        if form not in SEC_ANNUAL_FORMS or fiscal_period not in {"", "FY"}:
+            continue
+
+        end_key = str(entry.get("end") or "").strip()
+        try:
+            end_date = datetime.strptime(end_key, "%Y-%m-%d")
+        except (TypeError, ValueError):
+            continue
+
+        span_days = None
+        start_key = str(entry.get("start") or "").strip()
+        if start_key:
+            try:
+                span_days = (end_date - datetime.strptime(start_key, "%Y-%m-%d")).days
+            except (TypeError, ValueError):
+                continue
+        if not is_instant and (span_days is None or not 250 <= span_days <= 430):
+            continue
+
+        value = _financial_number(entry.get("val"))
+        if value is None:
+            continue
+        if metric_key in SEC_NEGATIVE_CASH_FLOW_METRICS:
+            value = -abs(value)
+
+        filed = str(entry.get("filed") or "")
+        accession = str(entry.get("accn") or "")
+        score = (
+            filed,
+            accession,
+            -abs((span_days if span_days is not None else 365) - 365),
+        )
+        previous = selected.get(end_key)
+        if previous is None or score > previous[0]:
+            selected[end_key] = (score, value)
+
+    newest_periods = sorted(selected, reverse=True)[:10]
+    return {
+        period_key: selected[period_key][1]
+        for period_key in newest_periods
+    }
+
+
+def _derive_sec_metric(dated_values, target_key, left_key, right_key, operation):
+    target = dated_values.setdefault(target_key, {})
+    left_values = dated_values.get(left_key, {})
+    right_values = dated_values.get(right_key, {})
+    for period_key in set(left_values).intersection(right_values):
+        if period_key in target:
+            continue
+        left = _financial_number(left_values.get(period_key))
+        right = _financial_number(right_values.get(period_key))
+        if left is None or right is None:
+            continue
+        value = operation(left, right)
+        if _financial_number(value) is not None:
+            target[period_key] = value
+    if not target:
+        dated_values.pop(target_key, None)
+
+
+def _parse_sec_companyfacts(payload):
+    facts = payload.get("facts") if isinstance(payload, dict) else None
+    us_gaap = facts.get("us-gaap") if isinstance(facts, dict) else None
+    if not isinstance(us_gaap, dict):
+        return {}
+
+    dated_values = {}
+    for metric_key, concept_names in SEC_COMPANYFACTS_CONCEPTS.items():
+        target = {}
+        for concept_name in concept_names:
+            concept_values = _parse_sec_annual_fact(
+                us_gaap.get(concept_name),
+                metric_key,
+            )
+            for period_key, value in concept_values.items():
+                target.setdefault(period_key, value)
+        if target:
+            dated_values[metric_key] = target
+
+    # Derivazioni prudenti: si calcolano solo quando entrambi i componenti
+    # dello stesso esercizio SEC sono disponibili.
+    _derive_sec_metric(
+        dated_values,
+        "GrossProfit",
+        "TotalRevenue",
+        "CostOfRevenue",
+        lambda revenue, cost: revenue - cost,
+    )
+    _derive_sec_metric(
+        dated_values,
+        "OperatingIncome",
+        "GrossProfit",
+        "OperatingExpense",
+        lambda gross_profit, expenses: gross_profit - expenses,
+    )
+    _derive_sec_metric(
+        dated_values,
+        "TotalExpenses",
+        "CostOfRevenue",
+        "OperatingExpense",
+        lambda cost, operating_expenses: cost + operating_expenses,
+    )
+    _derive_sec_metric(
+        dated_values,
+        "TotalNonCurrentAssets",
+        "TotalAssets",
+        "CurrentAssets",
+        lambda total, current: total - current,
+    )
+    _derive_sec_metric(
+        dated_values,
+        "TotalNonCurrentLiabilitiesNetMinorityInterest",
+        "TotalLiabilitiesNetMinorityInterest",
+        "CurrentLiabilities",
+        lambda total, current: total - current,
+    )
+    _derive_sec_metric(
+        dated_values,
+        "TotalDebt",
+        "CurrentDebt",
+        "LongTermDebt",
+        lambda current_debt, long_term_debt: current_debt + long_term_debt,
+    )
+    _derive_sec_metric(
+        dated_values,
+        "CashCashEquivalentsAndShortTermInvestments",
+        "CashAndCashEquivalents",
+        "OtherShortTermInvestments",
+        lambda cash, investments: cash + investments,
+    )
+    _derive_sec_metric(
+        dated_values,
+        "WorkingCapital",
+        "CurrentAssets",
+        "CurrentLiabilities",
+        lambda assets, liabilities: assets - liabilities,
+    )
+    _derive_sec_metric(
+        dated_values,
+        "FreeCashFlow",
+        "OperatingCashFlow",
+        "CapitalExpenditure",
+        lambda operating_cash, capex: operating_cash + capex,
+    )
+    return dated_values
+
+
+def _fetch_financial_timeseries_sec(ticker, frequency):
+    if frequency != "annual":
+        return {}, {}
+    try:
+        payload = _fetch_sec_companyfacts_payload(ticker)
+        return _parse_sec_companyfacts(payload), {}
+    except Exception:
+        # La SEC è una fonte di completamento: non deve mai interrompere Yahoo.
+        return {}, {}
+
+
+def _financial_number(value):
+    if isinstance(value, dict):
+        value = value.get("raw")
+    try:
+        number = float(value)
+        return number if np.isfinite(number) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _statement_metric_keys(statement_key):
+    statement = FINANCIAL_STATEMENT_CONFIG[statement_key]
+    keys = [row["key"] for row in statement["rows"]]
+    source_key = {
+        "income": "financials",
+        "balance": "balance-sheet",
+        "cash": "cash-flow",
+    }[statement_key]
+    if yf_const is not None:
+        try:
+            yahoo_keys = yf_const.fundamentals_keys.get(source_key, [])
+        except Exception:
+            yahoo_keys = []
+        for key in yahoo_keys:
+            if key not in keys:
+                keys.append(key)
+    return keys
+
+
+def _fetch_financial_series_request(ticker, prefix, metric_keys):
+    requested_types = [f"{prefix}{key}" for key in metric_keys]
+    encoded_symbol = urllib.parse.quote(ticker, safe="")
+    encoded_types = urllib.parse.quote(",".join(requested_types), safe=",")
+    period1 = int(datetime(2016, 1, 1, tzinfo=timezone.utc).timestamp())
+    period2 = int((datetime.now(timezone.utc) + timedelta(days=2)).timestamp())
+    url = (
+        "https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/"
+        f"timeseries/{encoded_symbol}?symbol={encoded_symbol}&type={encoded_types}"
+        f"&period1={period1}&period2={period2}"
+    )
+
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return {}, {}
+
+    results = payload.get("timeseries", {}).get("result") or []
+    dated_values = {}
+    trailing_values = {}
+
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        for series_key, entries in item.items():
+            if not isinstance(entries, list):
+                continue
+            if prefix != "trailing" and series_key.startswith(prefix):
+                metric_key = series_key[len(prefix):]
+                target = dated_values.setdefault(metric_key, {})
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    as_of_date = entry.get("asOfDate")
+                    value = _financial_number(entry.get("reportedValue"))
+                    if as_of_date and value is not None:
+                        target[str(as_of_date)] = value
+            elif prefix == "trailing" and series_key.startswith("trailing"):
+                metric_key = series_key[len("trailing"):]
+                valid_entries = []
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    value = _financial_number(entry.get("reportedValue"))
+                    if value is not None:
+                        valid_entries.append((str(entry.get("asOfDate") or ""), value))
+                if valid_entries:
+                    trailing_values[metric_key] = sorted(valid_entries)[-1][1]
+
+    return dated_values, trailing_values
+
+
+def _fetch_financial_timeseries_direct(ticker, frequency):
+    prefix = "annual" if frequency == "annual" else "quarterly"
+    jobs = []
+    for statement_key, statement in FINANCIAL_STATEMENT_CONFIG.items():
+        metric_keys = _statement_metric_keys(statement_key)
+        jobs.append((prefix, metric_keys))
+        if statement.get("includeTtm"):
+            jobs.append(("trailing", metric_keys))
+
+    dated_values = {}
+    trailing_values = {}
+    with ThreadPoolExecutor(max_workers=min(5, len(jobs))) as executor:
+        futures = {
+            executor.submit(
+                _fetch_financial_series_request,
+                ticker,
+                job_prefix,
+                metric_keys,
+            ): job_prefix
+            for job_prefix, metric_keys in jobs
+        }
+        for future in as_completed(futures):
+            try:
+                job_dated, job_trailing = future.result()
+            except Exception:
+                continue
+            for metric_key, values in job_dated.items():
+                dated_values.setdefault(metric_key, {}).update(values)
+            trailing_values.update(job_trailing)
+
+    return dated_values, trailing_values
+
+
+def _fetch_financial_timeseries_yfinance(ticker, frequency):
+    stock = yf.Ticker(ticker)
+    yf_frequency = "yearly" if frequency == "annual" else "quarterly"
+    dated_values = {}
+    trailing_values = {}
+
+    getter_by_statement = {
+        "income": "get_income_stmt",
+        "balance": "get_balance_sheet",
+        "cash": "get_cash_flow",
+    }
+    for statement_key, getter_name in getter_by_statement.items():
+        getter = getattr(stock, getter_name, None)
+        if not callable(getter):
+            continue
+        try:
+            frame = getter(freq=yf_frequency)
+        except Exception:
+            frame = pd.DataFrame()
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            for metric_key in _statement_metric_keys(statement_key):
+                if metric_key not in frame.index:
+                    continue
+                target = dated_values.setdefault(metric_key, {})
+                for column in frame.columns:
+                    value = _financial_number(frame.at[metric_key, column])
+                    if value is None:
+                        continue
+                    try:
+                        date_key = pd.Timestamp(column).strftime("%Y-%m-%d")
+                    except Exception:
+                        date_key = str(column)
+                    target[date_key] = value
+
+        if not FINANCIAL_STATEMENT_CONFIG[statement_key].get("includeTtm"):
+            continue
+        try:
+            trailing_frame = getter(freq="trailing")
+        except Exception:
+            trailing_frame = pd.DataFrame()
+        if not isinstance(trailing_frame, pd.DataFrame) or trailing_frame.empty:
+            continue
+        for metric_key in _statement_metric_keys(statement_key):
+            if metric_key not in trailing_frame.index:
+                continue
+            values = pd.to_numeric(
+                trailing_frame.loc[metric_key],
+                errors="coerce",
+            ).dropna()
+            if not values.empty:
+                trailing_values[metric_key] = float(values.iloc[0])
+
+    return dated_values, trailing_values
+
+
+def _align_sec_periods_to_yahoo(yahoo_dated, sec_dated, max_days=45):
+    """Allinea globalmente gli esercizi SEC alle date fiscali Yahoo vicine."""
+
+    def parsed_dates(source):
+        parsed = {}
+        for period_values in (source or {}).values():
+            if not isinstance(period_values, dict):
+                continue
+            for period_key in period_values:
+                normalized = str(period_key)
+                if normalized in parsed:
+                    continue
+                try:
+                    parsed[normalized] = datetime.strptime(
+                        normalized,
+                        "%Y-%m-%d",
+                    )
+                except (TypeError, ValueError):
+                    continue
+        return parsed
+
+    yahoo_dates = parsed_dates(yahoo_dated)
+    sec_dates = parsed_dates(sec_dated)
+    if not yahoo_dates or not sec_dates:
+        return {
+            metric_key: (
+                dict(period_values)
+                if isinstance(period_values, dict)
+                else period_values
+            )
+            for metric_key, period_values in (sec_dated or {}).items()
+        }
+
+    try:
+        allowed_distance = max(0, int(max_days))
+    except (TypeError, ValueError):
+        allowed_distance = 45
+
+    yahoo_ordered = tuple(
+        sorted(yahoo_dates, key=lambda key: yahoo_dates[key])
+    )
+    sec_ordered = tuple(
+        sorted(sec_dates, key=lambda key: sec_dates[key])
+    )
+
+    def quality(score):
+        matches, same_month, total_distance, largest_distance = score
+        return (
+            matches,
+            same_month,
+            -total_distance,
+            -largest_distance,
+        )
+
+    @lru_cache(maxsize=None)
+    def best_matching(sec_index, yahoo_index):
+        if sec_index >= len(sec_ordered) or yahoo_index >= len(yahoo_ordered):
+            return (0, 0, 0, 0), ()
+
+        options = [
+            best_matching(sec_index + 1, yahoo_index),
+            best_matching(sec_index, yahoo_index + 1),
+        ]
+        sec_key = sec_ordered[sec_index]
+        yahoo_key = yahoo_ordered[yahoo_index]
+        distance = abs((sec_dates[sec_key] - yahoo_dates[yahoo_key]).days)
+        if distance <= allowed_distance:
+            remaining_score, remaining_pairs = best_matching(
+                sec_index + 1,
+                yahoo_index + 1,
+            )
+            same_month = int(
+                sec_dates[sec_key].year == yahoo_dates[yahoo_key].year
+                and sec_dates[sec_key].month == yahoo_dates[yahoo_key].month
+            )
+            matched_score = (
+                remaining_score[0] + 1,
+                remaining_score[1] + same_month,
+                remaining_score[2] + distance,
+                max(remaining_score[3], distance),
+            )
+            options.append(
+                (
+                    matched_score,
+                    ((sec_key, yahoo_key),) + remaining_pairs,
+                )
+            )
+
+        # A parità di qualità la sequenza di coppie rende il risultato stabile
+        # e tende a conservare gli abbinamenti più recenti.
+        return max(
+            options,
+            key=lambda candidate: (
+                quality(candidate[0]),
+                candidate[1],
+            ),
+        )
+
+    _, matched_pairs = best_matching(0, 0)
+    alignment = {
+        sec_key: yahoo_key
+        for sec_key, yahoo_key in matched_pairs
+    }
+
+    aligned = {}
+    for metric_key, period_values in (sec_dated or {}).items():
+        if not isinstance(period_values, dict):
+            aligned[metric_key] = period_values
+            continue
+        target = {}
+        priorities = {}
+        for raw_period_key, value in period_values.items():
+            period_key = str(raw_period_key)
+            aligned_key = alignment.get(period_key, period_key)
+            distance = (
+                abs((sec_dates[period_key] - yahoo_dates[aligned_key]).days)
+                if period_key in sec_dates and aligned_key in yahoo_dates
+                else 0
+            )
+            priority = (
+                0 if period_key == aligned_key else 1,
+                distance,
+                period_key,
+            )
+            if aligned_key not in target or priority < priorities[aligned_key]:
+                target[aligned_key] = value
+                priorities[aligned_key] = priority
+        aligned[metric_key] = target
+    return aligned
+
+
+def _merge_financial_timeseries(
+    primary_dated,
+    primary_trailing,
+    fallback_dated,
+    fallback_trailing,
+):
+    """Completa una serie primaria senza sostituirne i valori validi."""
+    merged_dated = {}
+
+    # Il fallback viene copiato per primo: i valori validi della fonte diretta,
+    # applicati per ultimi, mantengono sempre la priorità.
+    for source in (fallback_dated or {}, primary_dated or {}):
+        for metric_key, period_values in source.items():
+            if not isinstance(period_values, dict):
+                continue
+            target = merged_dated.setdefault(metric_key, {})
+            for period_key, value in period_values.items():
+                if _financial_number(value) is not None:
+                    target[str(period_key)] = value
+
+    merged_trailing = {}
+    for source in (fallback_trailing or {}, primary_trailing or {}):
+        for metric_key, value in source.items():
+            if _financial_number(value) is not None:
+                merged_trailing[metric_key] = value
+
+    return merged_dated, merged_trailing
+
+
+def _fetch_financial_timeseries(ticker, frequency):
+    try:
+        direct_dated, direct_trailing = _fetch_financial_timeseries_direct(
+            ticker,
+            frequency,
+        )
+    except Exception:
+        direct_dated, direct_trailing = {}, {}
+
+    # Anche una risposta non vuota può essere parziale per singola voce o
+    # esercizio. yfinance viene quindi usato come integrazione; il merge
+    # conserva i valori della fonte diretta in caso di sovrapposizione.
+    try:
+        fallback_dated, fallback_trailing = _fetch_financial_timeseries_yfinance(
+            ticker,
+            frequency,
+        )
+    except Exception:
+        fallback_dated, fallback_trailing = {}, {}
+
+    yahoo_dated, yahoo_trailing = _merge_financial_timeseries(
+        direct_dated,
+        direct_trailing,
+        fallback_dated,
+        fallback_trailing,
+    )
+
+    # Company Facts completa, quando disponibile, lo storico annuale dei
+    # titoli registrati presso la SEC. Yahoo resta sempre la fonte primaria:
+    # il merge aggiunge soltanto periodi o metriche mancanti.
+    try:
+        sec_dated, _ = _fetch_financial_timeseries_sec(ticker, frequency)
+    except Exception:
+        sec_dated = {}
+    sec_dated = _align_sec_periods_to_yahoo(yahoo_dated, sec_dated)
+    return _merge_financial_timeseries(
+        yahoo_dated,
+        yahoo_trailing,
+        sec_dated,
+        {},
+    )
+
+
+FINANCIAL_EXTRA_LABELS = {
+    "TaxEffectOfUnusualItems": "Effetto fiscale degli elementi non ricorrenti",
+    "TaxRateForCalcs": "Aliquota fiscale utilizzata",
+    "NormalizedEBITDA": "EBITDA normalizzato",
+    "NormalizedDilutedEPS": "EPS diluito normalizzato",
+    "NormalizedBasicEPS": "EPS base normalizzato",
+    "TotalUnusualItems": "Elementi non ricorrenti totali",
+    "TotalUnusualItemsExcludingGoodwill": "Elementi non ricorrenti escluso avviamento",
+    "NetIncomeFromContinuingOperationNetMinorityInterest": "Utile da attività continuative netto minoranze",
+    "ReconciledDepreciation": "Ammortamenti riconciliati",
+    "ReconciledCostOfRevenue": "Costo dei ricavi riconciliato",
+    "NetIncomeFromContinuingAndDiscontinuedOperation": "Utile da attività continuative e cessate",
+    "ContinuingAndDiscontinuedDilutedEPS": "EPS diluito attività continuative e cessate",
+    "ContinuingAndDiscontinuedBasicEPS": "EPS base attività continuative e cessate",
+    "NetIncomeContinuousOperations": "Utile da attività continuative",
+    "NetIncome": "Utile netto",
+    "NetIncomeIncludingNoncontrollingInterests": "Utile netto incluse minoranze",
+    "OtherNonOperatingIncomeExpenses": "Altri proventi e oneri non operativi",
+    "InterestExpenseNonOperating": "Interessi passivi non operativi",
+    "InterestIncomeNonOperating": "Interessi attivi non operativi",
+    "OperatingRevenue": "Ricavi operativi",
+    "OtherOperatingExpenses": "Altre spese operative",
+    "DepreciationAndAmortizationInIncomeStatement": "Ammortamenti nel conto economico",
+    "DepreciationIncomeStatement": "Ammortamento nel conto economico",
+    "TreasurySharesNumber": "Numero azioni proprie",
+    "PreferredSharesNumber": "Numero azioni privilegiate",
+    "ShareIssued": "Azioni emesse",
+    "NetTangibleAssets": "Attività tangibili nette",
+    "CapitalLeaseObligations": "Obblighi per leasing finanziari",
+    "CommonStockEquity": "Patrimonio netto azioni ordinarie",
+    "TotalCapitalization": "Capitalizzazione totale",
+    "GainsLossesNotAffectingRetainedEarnings": "Utili e perdite non imputati a riserva",
+    "OtherEquityAdjustments": "Altre rettifiche del patrimonio netto",
+    "RetainedEarnings": "Utili portati a nuovo",
+    "AdditionalPaidInCapital": "Sovrapprezzo azioni",
+    "CapitalStock": "Capitale sociale",
+    "CommonStock": "Azioni ordinarie",
+    "OtherCurrentAssets": "Altre attività correnti",
+    "OtherNonCurrentAssets": "Altre attività non correnti",
+    "OtherCurrentLiabilities": "Altre passività correnti",
+    "OtherNonCurrentLiabilities": "Altre passività non correnti",
+    "TradeandOtherPayablesNonCurrent": "Debiti commerciali e altri debiti non correnti",
+    "PayablesAndAccruedExpenses": "Debiti e ratei passivi",
+    "CurrentDebtAndCapitalLeaseObligation": "Debito corrente e leasing",
+    "LongTermDebtAndCapitalLeaseObligation": "Debito a lungo termine e leasing",
+    "LongTermCapitalLeaseObligation": "Obblighi di leasing a lungo termine",
+    "CurrentDeferredLiabilities": "Passività differite correnti",
+    "CurrentDeferredRevenue": "Ricavi differiti correnti",
+    "CurrentCapitalLeaseObligation": "Obblighi di leasing correnti",
+    "OtherCurrentBorrowings": "Altri finanziamenti correnti",
+    "CommercialPaper": "Commercial paper",
+    "CurrentAccruedExpenses": "Ratei passivi correnti",
+    "Payables": "Debiti",
+    "TotalTaxPayable": "Debiti tributari totali",
+    "IncomeTaxPayable": "Imposte sul reddito da pagare",
+    "NonCurrentDeferredAssets": "Attività differite non correnti",
+    "NonCurrentDeferredTaxesAssets": "Attività fiscali differite non correnti",
+    "InvestmentsAndAdvances": "Investimenti e anticipazioni",
+    "OtherInvestments": "Altri investimenti",
+    "InvestmentinFinancialAssets": "Investimenti in attività finanziarie",
+    "AvailableForSaleSecurities": "Titoli disponibili per la vendita",
+    "GrossPPE": "Immobili, impianti e macchinari lordi",
+    "AccumulatedDepreciation": "Ammortamento accumulato",
+    "Leases": "Leasing",
+    "OtherProperties": "Altre proprietà",
+    "MachineryFurnitureEquipment": "Macchinari, arredi e attrezzature",
+    "LandAndImprovements": "Terreni e migliorie",
+    "Properties": "Proprietà",
+    "OtherShortTermInvestments": "Altri investimenti a breve termine",
+    "Receivables": "Crediti",
+    "OtherReceivables": "Altri crediti",
+    "CashEquivalents": "Equivalenti di cassa",
+    "CashFinancial": "Liquidità finanziaria",
+    "FinishedGoods": "Prodotti finiti",
+    "RawMaterials": "Materie prime",
+    "ChangesInCash": "Variazione della liquidità",
+    "BeginningCashPosition": "Liquidità iniziale",
+    "EffectOfExchangeRateChanges": "Effetto delle variazioni dei cambi",
+    "CashFlowFromContinuingFinancingActivities": "Flusso finanziario da attività continuative",
+    "CashFlowFromContinuingInvestingActivities": "Flusso da investimenti delle attività continuative",
+    "CashFlowFromContinuingOperatingActivities": "Flusso operativo da attività continuative",
+    "NetOtherFinancingCharges": "Altri oneri finanziari netti",
+    "CommonStockIssuance": "Emissione di azioni ordinarie",
+    "CommonStockPayments": "Pagamenti per azioni ordinarie",
+    "CommonStockDividendPaid": "Dividendi pagati su azioni ordinarie",
+    "NetCommonStockIssuance": "Emissione netta di azioni ordinarie",
+    "NetIssuancePaymentsOfDebt": "Emissioni e rimborsi netti del debito",
+    "NetShortTermDebtIssuance": "Emissione netta di debito a breve termine",
+    "NetLongTermDebtIssuance": "Emissione netta di debito a lungo termine",
+    "ShortTermDebtPayments": "Rimborsi del debito a breve termine",
+    "LongTermDebtPayments": "Rimborsi del debito a lungo termine",
+    "LongTermDebtIssuance": "Emissione di debito a lungo termine",
+    "NetInvestmentPurchaseAndSale": "Acquisto e vendita netta di investimenti",
+    "PurchaseOfInvestment": "Acquisto di investimenti",
+    "SaleOfInvestment": "Vendita di investimenti",
+    "NetPPEPurchaseAndSale": "Acquisto e vendita netta di immobilizzazioni",
+    "PurchaseOfPPE": "Acquisto di immobilizzazioni",
+    "NetOtherInvestingChanges": "Altre variazioni nette da investimenti",
+    "NetBusinessPurchaseAndSale": "Acquisti e cessioni nette di attività",
+    "PurchaseOfBusiness": "Acquisizioni di attività",
+    "ChangeInOtherWorkingCapital": "Variazione di altro capitale circolante",
+    "ChangeInOtherCurrentLiabilities": "Variazione di altre passività correnti",
+    "ChangeInOtherCurrentAssets": "Variazione di altre attività correnti",
+    "ChangeInAccountPayable": "Variazione dei debiti commerciali",
+    "ChangeInPayablesAndAccruedExpense": "Variazione debiti e ratei",
+    "ChangesInAccountReceivables": "Variazione crediti commerciali",
+    "OtherNonCashItems": "Altri elementi non monetari",
+    "DeferredTax": "Imposte differite",
+    "DeferredIncomeTax": "Imposte sul reddito differite",
+    "DepreciationAmortizationDepletion": "Ammortamenti e svalutazioni",
+    "OperatingGainsLosses": "Utili e perdite operative",
+}
+
+
+def _financial_label(metric_key):
+    if metric_key in FINANCIAL_EXTRA_LABELS:
+        return FINANCIAL_EXTRA_LABELS[metric_key]
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", metric_key)
+    spaced = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", spaced)
+    return spaced.replace(" And ", " e ").replace(" Of ", " di ")
+
+
+def _financial_format(metric_key):
+    if (
+        "EPS" in metric_key
+        or metric_key.endswith("PerShare")
+        or "Rate" in metric_key
+        or "Margin" in metric_key
+    ):
+        return "perShare"
+    return "number"
+
+
+def _serialize_financial_statements(dated_values, trailing_values, frequency):
+    max_periods = 10 if frequency == "annual" else 12
+    statements = {}
+
+    for statement_key, statement in FINANCIAL_STATEMENT_CONFIG.items():
+        configured_rows = list(statement["rows"])
+        configured_keys = {row["key"] for row in configured_rows}
+        extra_rows = [
+            {
+                "key": metric_key,
+                "label": _financial_label(metric_key),
+                "format": _financial_format(metric_key),
+                "detail": True,
+            }
+            for metric_key in _statement_metric_keys(statement_key)
+            if metric_key not in configured_keys
+        ]
+        row_configs = configured_rows + extra_rows
+        metric_keys = [row["key"] for row in row_configs]
+        dates = sorted(
+            {
+                date
+                for metric_key in metric_keys
+                for date in dated_values.get(metric_key, {}).keys()
+            },
+            reverse=True,
+        )[:max_periods]
+        has_ttm = bool(
+            statement.get("includeTtm")
+            and any(trailing_values.get(metric_key) is not None for metric_key in metric_keys)
+        )
+        periods = ([{"key": "TTM", "label": "TTM"}] if has_ttm else [])
+        periods.extend({"key": date, "label": date} for date in dates)
+
+        rows = []
+        for row_config in row_configs:
+            metric_key = row_config["key"]
+            values = {}
+            if has_ttm:
+                values["TTM"] = trailing_values.get(metric_key)
+            for date in dates:
+                values[date] = dated_values.get(metric_key, {}).get(date)
+            if not any(value is not None for value in values.values()):
+                continue
+            rows.append(
+                {
+                    "key": metric_key,
+                    "label": row_config["label"],
+                    "format": row_config.get("format", "number"),
+                    "detail": bool(row_config.get("detail")),
+                    "values": values,
+                }
+            )
+
+        statements[statement_key] = {
+            "label": statement["label"],
+            "periods": periods,
+            "rows": rows,
+        }
+
+    return statements
+
 
 def _fetch_quote_fields(ticker):
     try:
@@ -938,6 +3669,7 @@ def _fetch_quote_fields(ticker):
         return {}
     q0 = results[0]
     return {
+        "regularMarketPrice": q0.get("regularMarketPrice"),
         "marketCap": q0.get("marketCap"),
         "trailingPE": q0.get("trailingPE"),
         "forwardPE": q0.get("forwardPE"),
@@ -954,7 +3686,11 @@ def _fetch_quote_fields(ticker):
         "trailingAnnualDividendRate": q0.get("trailingAnnualDividendRate"),
         "trailingAnnualDividendYield": q0.get("trailingAnnualDividendYield"),
         "shortName": q0.get("shortName") or q0.get("longName"),
-        "sector": q0.get("sector") or q0.get("industry")
+        "sector": q0.get("sector"),
+        "industry": q0.get("industry"),
+        "exchange": q0.get("fullExchangeName") or q0.get("exchange"),
+        "quoteType": q0.get("quoteType"),
+        "currency": q0.get("currency"),
     }
 
 def _fetch_quote_summary_fields(ticker):
@@ -1000,7 +3736,8 @@ def _fetch_quote_summary_fields(ticker):
         "priceToBook": raw(stats, "priceToBook"),
         "bookValue": raw(stats, "bookValue"),
         "totalRevenue": raw(financial, "totalRevenue"),
-        "netIncomeToCommon": raw(financial, "netIncomeToCommon") or raw(financial, "netIncome")
+        "netIncomeToCommon": raw(financial, "netIncomeToCommon") or raw(financial, "netIncome"),
+        "currency": financial.get("financialCurrency"),
     }
 
 def _to_float(value):
@@ -1051,7 +3788,7 @@ def _to_text(value):
 def _merge_missing_info(target, source):
     if not isinstance(source, dict):
         return
-    text_keys = {"shortName", "sector"}
+    text_keys = {"shortName", "sector", "currency"}
     for k, v in source.items():
         if target.get(k) is not None or v is None:
             continue
@@ -1079,7 +3816,7 @@ def _normalize_info_payload(raw_info):
         "trailingPE": pick("trailingPE", "trailingPe"),
         "forwardPE": pick("forwardPE", "forwardPe"),
         "trailingEps": pick("trailingEps", "epsTrailingTwelveMonths", "eps"),
-        "epsForward": pick("forwardEps", "epsForward", "epsNext5Y"),
+        "epsForward": pick("forwardEps", "epsForward"),
         "sharesOutstanding": pick("sharesOutstanding", "shareOutstanding", "shares"),
         "dividendRate": pick("dividendRate", "trailingAnnualDividendRate"),
         "dividendYield": pick("dividendYield", "trailingAnnualDividendYield"),
@@ -1103,6 +3840,7 @@ def _normalize_info_payload(raw_info):
         "earningsGrowth": pick("earningsGrowth", "earningsQuarterlyGrowth"),
         "shortName": pick("shortName", "longName"),
         "sector": pick("sector", "industry", "category"),
+        "currency": pick("currency", "financialCurrency"),
     }
     return normalized
 
@@ -1153,6 +3891,7 @@ def _extract_fast_info_fields(stock):
             "tenDayAverageVolume": fi_pick("tenDayAverageVolume", "ten_day_average_volume"),
             "threeMonthAverageVolume": fi_pick("threeMonthAverageVolume", "three_month_average_volume"),
             "lastPrice": fi_pick("lastPrice", "last_price", "regularMarketPrice", "regular_market_price"),
+            "currency": fi_pick("currency"),
         }
     except Exception:
         return {}
@@ -1243,7 +3982,11 @@ def _fetch_quote_page_fields(ticker):
         if val is not None:
             out[out_key] = val
 
-    for text_key, out_key in (("shortName", "shortName"), ("longName", "shortName"), ("sector", "sector")):
+    for text_key, out_key in (
+        ("shortName", "shortName"),
+        ("longName", "shortName"),
+        ("sector", "sector"),
+    ):
         if out.get(out_key):
             continue
         m = re.search(rf'\\"{re.escape(text_key)}\\":\\"([^\\"]+)\\"', html)
@@ -1656,6 +4399,798 @@ def toggle_social_save(user, _token, portfolio_id):
     )
 
 
+@app.route("/search/suggestions")
+def search_suggestions():
+    query = (request.args.get("q") or "").strip()
+    if not query:
+        return jsonify({"suggestions": []})
+
+    if len(query) > 80:
+        return jsonify({"error": "Ricerca troppo lunga"}), 400
+
+    try:
+        limit = max(1, min(int(request.args.get("limit", "8")), 10))
+    except (TypeError, ValueError):
+        limit = 8
+
+    cache_key = f"{query.casefold()}:{limit}"
+    cached = _cache_get(
+        search_suggestions_cache,
+        cache_key,
+        SEARCH_SUGGESTIONS_CACHE_TTL,
+    )
+    if cached is not None:
+        return jsonify(cached)
+
+    try:
+        params = urllib.parse.urlencode(
+            {
+                "q": query,
+                "quotesCount": max(limit * 2, 8),
+                "newsCount": 0,
+                "listsCount": 0,
+                "enableFuzzyQuery": "true",
+                "quotesQueryId": "tss_match_phrase_query",
+            }
+        )
+        url = f"https://query1.finance.yahoo.com/v1/finance/search?{params}"
+        yahoo_request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+            },
+        )
+        with urllib.request.urlopen(yahoo_request, timeout=8) as response:
+            body = response.read()
+            if response.headers.get("Content-Encoding", "").lower() == "gzip":
+                body = gzip.decompress(body)
+            search_payload = json.loads(body.decode("utf-8"))
+        results = search_payload.get("quotes") or []
+
+        suggestions = []
+        seen_symbols = set()
+        for result in results:
+            symbol = str(result.get("symbol") or "").strip().upper()
+            if not symbol or symbol in seen_symbols:
+                continue
+
+            quote_type = str(
+                result.get("quoteType")
+                or result.get("typeDisp")
+                or ""
+            ).strip().upper()
+            if quote_type in {"OPTION", "NONE"}:
+                continue
+
+            name = str(
+                result.get("shortname")
+                or result.get("longname")
+                or result.get("name")
+                or symbol
+            ).strip()
+            exchange = str(
+                result.get("exchDisp")
+                or result.get("exchange")
+                or ""
+            ).strip()
+
+            suggestions.append(
+                {
+                    "symbol": symbol,
+                    "name": name,
+                    "exchange": exchange,
+                    "type": quote_type,
+                }
+            )
+            seen_symbols.add(symbol)
+            if len(suggestions) >= limit:
+                break
+
+        payload = {"suggestions": suggestions}
+        _cache_set(search_suggestions_cache, cache_key, payload, max_size=240)
+        return jsonify(payload)
+    except Exception as exc:
+        print("Errore suggerimenti ricerca:", exc)
+        return jsonify({"suggestions": [], "error": "Servizio suggerimenti temporaneamente non disponibile."}), 502
+
+
+@app.route("/market/tradingview-heatmap")
+def tradingview_heatmap():
+    """Proxy compatto per i dati dello Stock Heatmap di TradingView."""
+    cache_key = "spx500-stock-heatmap-v1"
+    cached = _cache_get(
+        stock_response_cache,
+        cache_key,
+        TRADINGVIEW_HEATMAP_CACHE_TTL,
+    )
+    if cached is not None:
+        return jsonify(cached)
+
+    query = {
+        "symbols": {"query": {"types": []}, "tickers": []},
+        "columns": [
+            "name",
+            "description",
+            "close",
+            "change",
+            "change|1W",
+            "change|1M",
+            "market_cap_basic",
+            "sector",
+        ],
+        "options": {"lang": "en"},
+        "range": [0, 500],
+        "sort": {"sortBy": "market_cap_basic", "sortOrder": "desc"},
+    }
+    try:
+        scanner_request = urllib.request.Request(
+            "https://scanner.tradingview.com/america/scan",
+            data=json.dumps(query).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(scanner_request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        columns = query["columns"]
+        rows = []
+        for item in payload.get("data") or []:
+            values = item.get("d") or []
+            row = dict(zip(columns, values))
+            symbol = str(item.get("s") or "").split(":")[-1].strip().upper()
+            if not symbol or not row.get("market_cap_basic"):
+                continue
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "name": row.get("description") or row.get("name") or symbol,
+                    "price": row.get("close"),
+                    "change1D": row.get("change"),
+                    "change1W": row.get("change|1W"),
+                    "change1M": row.get("change|1M"),
+                    "marketCap": row.get("market_cap_basic"),
+                    "sector": _canonical_heatmap_sector(row.get("sector")),
+                }
+            )
+        result = {"source": "TradingView", "dataSource": "SPX500", "rows": rows}
+        _cache_set(stock_response_cache, cache_key, result, max_size=4)
+        return jsonify(result)
+    except Exception as exc:
+        print("Errore heatmap TradingView:", exc)
+        return jsonify({"error": "Dati TradingView temporaneamente non disponibili."}), 502
+
+
+SECTOR_RELATION_ETFS = {
+    "basic materials": "XLB",
+    "materials": "XLB",
+    "communication services": "XLC",
+    "consumer cyclical": "XLY",
+    "consumer cyclicals": "XLY",
+    "consumer defensive": "XLP",
+    "consumer staples": "XLP",
+    "energy": "XLE",
+    "financial services": "XLF",
+    "financials": "XLF",
+    "financial": "XLF",
+    "healthcare": "XLV",
+    "health care": "XLV",
+    "industrials": "XLI",
+    "real estate": "XLRE",
+    "technology": "XLK",
+    "utilities": "XLU",
+}
+
+
+def _heatmap_relation_history(symbol):
+    """Fetch one adjusted daily close series, with the same provider fallbacks as history."""
+    cached = _cache_get(heatmap_prices_cache, symbol, HEATMAP_RELATIONS_CACHE_TTL)
+    if cached is not None:
+        return cached
+    for candidate in ticker_candidates(symbol):
+        history = _fetch_interval_history(candidate, yf.Ticker(candidate), "5y", "1d", "5y")
+        if history.empty or "Close" not in history.columns:
+            continue
+        price_column = "Adj Close" if "Adj Close" in history.columns and history["Adj Close"].notna().sum() >= 60 else "Close"
+        series = pd.to_numeric(history[price_column], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        series = series.where(series > 0)
+        if series.notna().sum() < 40:
+            continue
+        try:
+            index = pd.to_datetime(series.index)
+            if index.tz is None and history.attrs.get("timestampTimezone") == "UTC":
+                timezone = history.attrs.get("exchangeTimezoneName")
+                if timezone:
+                    index = index.tz_localize("UTC").tz_convert(timezone)
+            series.index = index.tz_localize(None).normalize()
+        except Exception:
+            series.index = pd.to_datetime(series.index, errors="coerce").normalize()
+        series = series[~series.index.isna()]
+        series = series[~series.index.duplicated(keep="last")].sort_index()
+        # Conservative completed-day cutoff, consistent for stock and factors.
+        # Never train or score on today's potentially still-open daily bar.
+        series = series.loc[series.index < pd.Timestamp.now(tz="UTC").tz_localize(None).normalize()]
+        series.attrs["priceBasis"] = "adjusted" if price_column == "Adj Close" else "close"
+        if series.notna().sum() >= 40:
+            result = (series, candidate)
+            _cache_set(heatmap_prices_cache, symbol, result, max_size=192)
+            return result
+    return pd.Series(dtype=float), None
+
+
+HEATMAP_SECTOR_ALIASES = {
+    "basic materials": "Basic Materials",
+    "materials": "Basic Materials",
+    "communication services": "Communication Services",
+    "consumer cyclical": "Consumer Cyclical",
+    "consumer cyclicals": "Consumer Cyclical",
+    "consumer discretionary": "Consumer Cyclical",
+    "consumer defensive": "Consumer Defensive",
+    "consumer staples": "Consumer Defensive",
+    "energy": "Energy",
+    "financial": "Financial Services",
+    "financial services": "Financial Services",
+    "financials": "Financial Services",
+    "health care": "Healthcare",
+    "healthcare": "Healthcare",
+    "industrials": "Industrials",
+    "real estate": "Real Estate",
+    "technology": "Technology",
+    "information technology": "Technology",
+    "tech": "Technology",
+    "utilities": "Utilities",
+}
+
+
+def _canonical_heatmap_sector(value):
+    raw = str(value or "").strip()
+    if raw.casefold() in {"", "other", "altro", "n/a", "n/d", "unknown", "none", "null", "-"}:
+        return "Other"
+    key = re.sub(r"[\s_/-]+", " ", raw.casefold()).strip()
+    return HEATMAP_SECTOR_ALIASES.get(key, raw)
+
+
+def _heatmap_sector_metadata(symbol):
+    """Resolve sector/name/cap for symbols outside the heat-map universe."""
+    for candidate in ticker_candidates(symbol):
+        merged = {}
+        try:
+            merged.update(_fetch_quote_fields(candidate))
+        except Exception:
+            pass
+        if not merged.get("sector") or not merged.get("currency"):
+            try:
+                merged.update(_fetch_quote_page_fields(candidate))
+            except Exception:
+                pass
+        if not merged.get("sector") or not merged.get("currency"):
+            try:
+                stock = yf.Ticker(candidate)
+                raw_info = _safe_get_info(stock)
+                merged_info = _normalize_info_payload(raw_info)
+                # Industry and fund category are not interchangeable with sector.
+                merged_info["sector"] = raw_info.get("sector")
+                # Trading currency, never the financial statements' currency.
+                merged_info["currency"] = raw_info.get("currency")
+                for key, value in merged_info.items():
+                    if merged.get(key) is None and value is not None:
+                        merged[key] = value
+            except Exception:
+                pass
+        if not merged.get("currency"):
+            try:
+                # Chart metadata also works when Yahoo's authenticated quote
+                # or yfinance info endpoints are unavailable.
+                _, chart_meta = _fetch_chart_data(candidate, "5d", "1d")
+                merged["currency"] = (chart_meta or {}).get("currency")
+            except Exception:
+                pass
+        sector = _canonical_heatmap_sector(merged.get("sector"))
+        if sector != "Other" or merged.get("currency"):
+            return {
+                "symbol": normalize_ticker(candidate),
+                "name": merged.get("shortName") or normalize_ticker(candidate),
+                "sector": sector,
+                "marketCap": merged.get("marketCap"),
+                "currency": merged.get("currency"),
+            }
+    return {}
+
+
+def _heatmap_currency(value):
+    """Return major quote currency and price-unit multiplier (not FX)."""
+    raw = str(value or "").strip()
+    minor_units = {"GBp": ("GBP", 0.01), "GBX": ("GBP", 0.01),
+                   "ZAc": ("ZAR", 0.01), "ILA": ("ILS", 0.01)}
+    if raw in minor_units:
+        return minor_units[raw]
+    code = raw.upper()
+    return (code, 1.0) if re.fullmatch(r"[A-Z]{3}", code) else (None, None)
+
+
+def _heatmap_usd_fx(currency):
+    """Historical units of target currency per USD; no backfill or invented FX."""
+    for symbol, inverse in ((f"USD{currency}=X", False), (f"{currency}USD=X", True)):
+        try:
+            prices, resolved = _heatmap_relation_history(symbol)
+        except Exception:
+            continue
+        clean = prices.where(np.isfinite(prices) & (prices > 0))
+        if clean.notna().sum() >= 40:
+            rates = 1.0 / clean if inverse else clean.copy()
+            return rates, {"symbol": resolved or symbol, "inverse": inverse,
+                           "units": f"{currency} per USD",
+                           "lastDate": clean.last_valid_index().date().isoformat()}
+    return pd.Series(dtype=float), None
+
+
+def _heatmap_convert_usd(prices, fx):
+    """Convert levels before calculating returns; preserve missing FX barriers."""
+    converted = prices * fx.reindex(prices.index)
+    converted.attrs = dict(prices.attrs)
+    return converted
+
+
+def _heatmap_prior_close(prices, calendar):
+    """Cross-market features: only earlier calendar dates, at most 4 days old.
+
+    Daily bars lack reliable close timestamps. Excluding same-date foreign
+    bars conservatively prevents a US close from leaking into an Asian or
+    European prediction. Invalid observations are never skipped/backfilled.
+    """
+    prices = prices.sort_index()
+    result = pd.Series(np.nan, index=calendar, dtype=float)
+    if not prices.empty:
+        positions = prices.index.searchsorted(calendar, side="left") - 1
+        valid = positions >= 0
+        offsets = np.flatnonzero(valid)
+        age = (calendar[valid] - prices.index[positions[valid]]).days
+        offsets = offsets[age <= 4]
+        result.iloc[offsets] = prices.iloc[positions[offsets]].to_numpy()
+    result.attrs = dict(prices.attrs)
+    return result
+
+
+def _heatmap_relation_returns(series, lag):
+    if series is None or len(series) <= lag:
+        return pd.Series(dtype=float)
+    valid = series.notna().rolling(lag + 1, min_periods=lag + 1).sum().eq(lag + 1)
+    return series.pct_change(lag, fill_method=None).where(valid).replace([np.inf, -np.inf], np.nan).dropna()
+
+
+def _heatmap_pair_stats(left, right, lag, minimum=40):
+    frame = pd.concat([left, right], axis=1, join="inner").dropna()
+    if len(frame) < minimum:
+        return {"correlation": None, "beta": None, "observations": int(len(frame))}
+    x = frame.iloc[:, 1].to_numpy(dtype=float)
+    y = frame.iloc[:, 0].to_numpy(dtype=float)
+    x_mean = float(np.mean(x))
+    y_mean = float(np.mean(y))
+    x_centered = x - x_mean
+    y_centered = y - y_mean
+    x_var = float(np.sum(x_centered ** 2))
+    y_var = float(np.sum(y_centered ** 2))
+    if x_var <= 1e-18 or y_var <= 1e-18:
+        return {"correlation": None, "beta": None, "observations": int(len(frame))}
+    covariance = float(np.sum(x_centered * y_centered))
+    correlation = covariance / np.sqrt(x_var * y_var)
+    beta = covariance / x_var
+    return {
+        "correlation": round(float(np.clip(correlation, -1, 1)), 6),
+        "beta": round(float(beta), 6),
+        "observations": int(len(frame)),
+    }
+
+
+def _heatmap_relation_ridge(target_returns, factor_returns, minimum=40):
+    usable = {key: value for key, value in factor_returns.items() if isinstance(value, pd.Series) and not value.empty}
+    if not usable:
+        return {"status": "insufficient_data", "features": [], "observations": 0, "rSquared": None, "intercept": None, "scenarios": []}
+    frame = pd.concat([target_returns.rename("target"), *[value.rename(key) for key, value in usable.items()]], axis=1, join="inner").dropna()
+    if len(frame) < minimum:
+        return {"status": "insufficient_data", "features": list(usable), "observations": int(len(frame)), "rSquared": None, "intercept": None, "scenarios": []}
+    feature_names = list(usable)
+    x = frame[feature_names].to_numpy(dtype=float)
+    y = frame["target"].to_numpy(dtype=float)
+    means = x.mean(axis=0)
+    scales = x.std(axis=0, ddof=1)
+    valid = np.isfinite(scales) & (scales > 1e-12)
+    feature_names = [name for name, keep in zip(feature_names, valid) if keep]
+    if not feature_names:
+        return {"status": "insufficient_variation", "features": [], "observations": int(len(frame)), "rSquared": None, "intercept": None, "scenarios": []}
+    x = frame[feature_names].to_numpy(dtype=float)
+    means = x.mean(axis=0)
+    scales = x.std(axis=0, ddof=1)
+    standardized = (x - means) / scales
+    alpha = 1.0
+    matrix = standardized.T @ standardized + alpha * np.eye(len(feature_names))
+    try:
+        standardized_beta = np.linalg.solve(matrix, standardized.T @ y)
+    except np.linalg.LinAlgError:
+        standardized_beta = np.linalg.lstsq(matrix, standardized.T @ y, rcond=None)[0]
+    beta = standardized_beta / scales
+    intercept = float(y.mean() - np.dot(beta, means))
+    fitted = intercept + x @ beta
+    residual = y - fitted
+    total_ss = float(np.sum((y - y.mean()) ** 2))
+    r_squared = 1 - float(np.sum(residual ** 2)) / total_ss if total_ss > 1e-18 else None
+    coefficients = [
+        {"factor": name, "beta": round(float(value), 6), "betaPct": round(float(value), 4)}
+        for name, value in zip(feature_names, beta)
+    ]
+    shocks = [-10, -5, 0, 5, 10]
+    scenarios = [
+        {
+            "factor": name,
+            "beta": round(float(value), 6),
+            "shocks": [
+                {"shockPct": shock, "predictedReturnPct": round(float((intercept + value * shock / 100) * 100), 4)}
+                for shock in shocks
+            ],
+        }
+        for name, value in zip(feature_names, beta)
+    ]
+    return {
+        "status": "ready",
+        "method": "ridge-standardized",
+        "alpha": alpha,
+        "features": coefficients,
+        "observations": int(len(frame)),
+        "rSquared": round(float(np.clip(r_squared, -1, 1)), 6) if r_squared is not None else None,
+        "interceptPct": round(intercept * 100, 6),
+        "scenarios": scenarios,
+    }
+
+
+
+
+def _load_page_daily_source(raw_ticker):
+    """One completed daily snapshot shared by Technicals and Seasonality."""
+    symbol = normalize_ticker(raw_ticker)
+    key = f"pages-20y:{symbol}:{datetime.now(timezone.utc).date()}"
+    source = _cache_get(page_daily_history_cache, key, timedelta(minutes=15))
+    if source is not None:
+        return source
+    for candidate in ticker_candidates(symbol):
+        for period in ("20y", "10y", "5y", "2y", "1y"):
+            history = _fetch_interval_history(candidate, yf.Ticker(candidate), period, "1d", period)
+            if history.empty:
+                continue
+            history = completed_daily_history(history)
+            if history.empty:
+                continue
+            _, meta = _fetch_chart_data(candidate, "5d", "1d")
+            columns = [c for c in ("Open", "High", "Low", "Close", "Adj Close", "Volume") if c in history]
+            digest = hashlib.sha256(pd.util.hash_pandas_object(history[columns], index=True).values.tobytes()).hexdigest()[:20]
+            history.attrs["pageSourceId"] = f"{candidate}:{digest}"
+            history.attrs["actualLookbackRequest"] = period
+            source = (history, candidate, meta or {})
+            _cache_set(page_daily_history_cache, key, source, max_size=24)
+            return source
+    return pd.DataFrame(), symbol, {}
+
+
+
+
+@app.route("/stock/<ticker>/structure-neural", methods=["POST"])
+def structure_neural(ticker):
+    symbol = normalize_ticker(ticker)
+    if not symbol or len(symbol) > 32 or not re.fullmatch(r"[A-Z0-9.^=\-]+", symbol):
+        return jsonify({"error": "Ticker non valido."}), 400
+    if request.content_length and request.content_length > 300_000:
+        return jsonify({"error": "Snapshot della pagina troppo grande."}), 413
+    payload = request.get_json(silent=True)
+    try:
+        validate_neural_request(payload)
+    except (TypeError, ValueError, KeyError, AttributeError, OverflowError):
+        return jsonify({"error": "Parametri o dati della pagina non validi: ricarica Previsioni e seleziona 1D, 1W o 1M."}), 400
+    if not structure_neural_lock.acquire(blocking=False):
+        return jsonify({"error": "Un addestramento è già in corso. Riprova tra poco."}), 429
+    try:
+        history, resolved, meta = _load_page_daily_source(symbol)
+        if history.empty:
+            return jsonify({"error": "Storico non disponibile per la rete neurale."}), 502
+        identity = hashlib.sha256(json.dumps(payload, sort_keys=True, allow_nan=False).encode()).hexdigest()
+        key = f"{STRUCTURE_NEURAL_VERSION}:{symbol}:{resolved}:{history.attrs.get('pageSourceId')}:{identity}"
+        cached = _cache_get(structure_neural_cache, key, timedelta(minutes=30))
+        if cached is not None:
+            return jsonify(cached)
+        result = build_structure_neural(history, payload)
+        result.update(symbol=resolved, requestedSymbol=symbol, currency=meta.get("currency"), source="Yahoo Finance · geometria della pagina Previsioni",
+                      sourceId=history.attrs.get("pageSourceId"), generatedAt=datetime.now(timezone.utc).isoformat())
+        result = _json_safe(result)
+        _cache_set(structure_neural_cache, key, result, max_size=24)
+        return jsonify(result)
+    except Exception as exc:
+        print("Errore rete struttura:", type(exc).__name__)
+        return jsonify({"error": "Rete neurale non disponibile. Verifica storico e dipendenze."}), 502
+    finally:
+        structure_neural_lock.release()
+
+
+@app.route("/stock/<ticker>/structure-neural/jobs", methods=["POST"])
+def structure_neural_submit(ticker):
+    symbol = normalize_ticker(ticker)
+    if not symbol or len(symbol) > 32 or not re.fullmatch(r"[A-Z0-9.^=\-]+", symbol):
+        return jsonify({"error": "Ticker non valido."}), 400
+    if request.content_length and request.content_length > 300_000:
+        return jsonify({"error": "Snapshot troppo grande."}), 413
+    payload = request.get_json(silent=True)
+    try:
+        validate_neural_request(payload)
+    except (TypeError, ValueError, KeyError, AttributeError, OverflowError):
+        return jsonify({"error": "Dati della pagina non validi: aggiorna Previsioni."}), 400
+    try:
+        from ml.structure_jobs import jobs
+    except ImportError:
+        from backend.ml.structure_jobs import jobs
+    try:
+        return jsonify(jobs.submit(symbol, payload)), 202
+    except (TypeError, ValueError):
+        return jsonify({"error": "Snapshot non serializzabile o non finito."}), 400
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 429
+
+
+@app.route("/stock/<ticker>/structure-neural/jobs/<job_id>")
+def structure_neural_job(ticker, job_id):
+    try:
+        from ml.structure_jobs import jobs
+    except ImportError:
+        from backend.ml.structure_jobs import jobs
+    state = jobs.get(normalize_ticker(ticker), job_id)
+    return (jsonify(state), 200) if state else (jsonify({"error": "Analisi non trovata: avviala nuovamente."}), 404)
+
+
+@app.route("/market/heatmap-relations/<ticker>")
+def heatmap_relations(ticker):
+    """Cross-sectional sector model using daily, monthly and annual aligned returns."""
+    requested = normalize_ticker(ticker)
+    if not requested:
+        return jsonify({"error": "Ticker non valido"}), 400
+    sector_hint = _canonical_heatmap_sector(request.args.get("sector"))
+    signal_cost_bps = _to_float(request.args.get("signalCostBps", "20"))
+    if signal_cost_bps is None or not 0 <= signal_cost_bps <= 500:
+        return jsonify({"error": "Costi non validi: inserire da 0 a 500 punti base."}), 400
+    requested_version = request.args.get("signalVersion")
+    if requested_version and requested_version != HEATMAP_SIGNAL_VERSION:
+        return jsonify({"error": "Versione del segnale non compatibile: aggiornare la pagina."}), 409
+    cache_key = f"heatmap-relations:v5-fx:{requested}:{sector_hint.casefold()}:{signal_cost_bps:g}"
+    cached = _cache_get(heatmap_relations_cache, cache_key, HEATMAP_RELATIONS_CACHE_TTL)
+    if cached is not None:
+        return jsonify(cached)
+    try:
+        heatmap_response = _cache_get(stock_response_cache, "spx500-stock-heatmap-v1", TRADINGVIEW_HEATMAP_CACHE_TTL)
+        if heatmap_response is None:
+            heatmap_response = tradingview_heatmap()
+            if isinstance(heatmap_response, tuple):
+                response_status = heatmap_response[1] if len(heatmap_response) > 1 else 200
+                heatmap_response = heatmap_response[0]
+                if response_status and int(response_status) >= 400:
+                    heatmap_response = None
+            heatmap_response = heatmap_response.get_json(silent=True) if hasattr(heatmap_response, "get_json") else None
+        rows = (heatmap_response or {}).get("rows") or []
+        target_row = next((row for row in rows if normalize_ticker(row.get("symbol")) == requested), None)
+        target_in_heatmap = target_row is not None
+        provider_sector = (target_row or {}).get("sector")
+        target_metadata = _heatmap_sector_metadata(requested)
+        if target_row is None or _canonical_heatmap_sector((target_row or {}).get("sector")).casefold() not in SECTOR_RELATION_ETFS:
+            # TradingView also uses narrower industry groups, such as Electronic
+            # Technology. Resolve the ETF sector from actual company metadata.
+            if _canonical_heatmap_sector(target_metadata.get("sector")) == "Other" and sector_hint != "Other":
+                target_metadata = {**target_metadata, "sector": sector_hint}
+            if target_row is None and target_metadata:
+                # A valid ticker can be outside the first 500 heat-map rows.
+                target_row = {"symbol": requested, **target_metadata}
+            elif target_row is not None and target_metadata:
+                target_row = {**target_row, **target_metadata, "symbol": normalize_ticker(target_row.get("symbol"))}
+            elif sector_hint != "Other":
+                # The search page already resolved the sector from its quote
+                # payload; use it when the provider metadata is rate-limited.
+                if target_row is None:
+                    target_row = {"symbol": requested, "name": requested, "sector": sector_hint}
+                else:
+                    target_row = {**target_row, "sector": sector_hint}
+        if not rows and not target_row:
+            return jsonify({"error": "Universo heat map temporaneamente non disponibile."}), 502
+        if target_row is None:
+            return jsonify({"error": "Settore del titolo non disponibile per il modello."}), 404
+        target_symbol = normalize_ticker(target_row.get("symbol"))
+        sector = _canonical_heatmap_sector(target_row.get("sector"))
+        if sector == "Other":
+            return jsonify({"error": "Settore del titolo non disponibile per il modello."}), 404
+        sector_key = sector.casefold()
+        peer_rows = sorted(
+            [
+                row for row in rows
+                if (_canonical_heatmap_sector(row.get("sector")).casefold() == sector_key
+                    or (provider_sector and str(row.get("sector") or "").strip() == provider_sector))
+                and normalize_ticker(row.get("symbol")) != target_symbol
+            ],
+            key=lambda row: float(row.get("marketCap") or 0),
+            reverse=True,
+        )[:24]
+        peer_symbols = [normalize_ticker(row.get("symbol")) for row in peer_rows if normalize_ticker(row.get("symbol"))]
+        sector_etf = SECTOR_RELATION_ETFS.get(sector.casefold())
+        sector_etfs = {label: symbol for label, symbol in {
+            "Basic Materials": "XLB", "Communication Services": "XLC", "Consumer Cyclical": "XLY",
+            "Consumer Defensive": "XLP", "Energy": "XLE", "Financial Services": "XLF",
+            "Healthcare": "XLV", "Industrials": "XLI", "Real Estate": "XLRE",
+            "Technology": "XLK", "Utilities": "XLU",
+        }.items()}
+        symbols = list(dict.fromkeys([target_symbol, *peer_symbols, *sector_etfs.values(), "SPY"]))
+        histories = {}
+        resolved_symbols = {}
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {executor.submit(_heatmap_relation_history, symbol): symbol for symbol in symbols}
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    history, resolved = future.result()
+                except Exception:
+                    history, resolved = pd.Series(dtype=float), None
+                if isinstance(history, pd.Series) and not history.empty:
+                    histories[symbol] = history
+                    resolved_symbols[symbol] = resolved or symbol
+        if target_symbol not in histories:
+            return jsonify({"error": "Storico del titolo non disponibile per il modello."}), 502
+        quote_currency = target_metadata.get("currency") or target_row.get("currency")
+        currency, unit_scale = _heatmap_currency(quote_currency)
+        cross_market = not target_in_heatmap or currency != "USD"
+        fx_info = None
+        currency_block = None
+        warnings = []
+        if not rows:
+            warnings.append("Heatmap non disponibile: modello basato sui proxy settoriali, senza peer della heatmap.")
+        if cross_market:
+            warnings.append("Settori e mercato sono proxy USA, non indici del mercato locale. Le chiusure estere e il cambio usati nelle previsioni precedono la data del titolo (massimo 4 giorni).")
+        if not currency:
+            currency_block = "Valuta di quotazione non verificata: impossibile confrontare i rendimenti in modo affidabile."
+        else:
+            target_attrs = dict(histories[target_symbol].attrs)
+            histories[target_symbol] = histories[target_symbol] * unit_scale
+            histories[target_symbol].attrs = target_attrs
+            if currency != "USD":
+                fx, fx_info = _heatmap_usd_fx(currency)
+                if fx_info is None:
+                    currency_block = f"Cambio storico USD/{currency} non disponibile: confronto e segnale sospesi."
+                else:
+                    for symbol in list(histories):
+                        if symbol != target_symbol:
+                            histories[symbol] = _heatmap_convert_usd(histories[symbol], fx)
+                    fx_info["method"] = "Prezzo USD × cambio storico; nessun riempimento dei cambi mancanti"
+        if currency_block:
+            # Do not show plausible-looking descriptive results in mixed currencies.
+            histories = {target_symbol: histories[target_symbol]}
+            warnings.append(currency_block)
+        horizons = {"daily": 1, "monthly": 21, "annual": 252}
+        peer_correlations = {key: [] for key in horizons}
+        sector_correlations = {key: [] for key in horizons}
+        models = {}
+        signals = {}
+        target_series = histories[target_symbol]
+        peer_series = {symbol: histories[symbol] for symbol in peer_symbols if symbol in histories}
+        signal_factors = {
+            label: histories[symbol] for label, symbol in sector_etfs.items()
+            if symbol in histories and histories[symbol].attrs.get("priceBasis") == "adjusted"
+            and symbol != target_symbol
+        }
+        if "SPY" in histories and histories["SPY"].attrs.get("priceBasis") == "adjusted" and target_symbol != "SPY":
+            signal_factors["Mercato · SPY"] = histories["SPY"]
+        signal_sector = next((label for label, symbol in sector_etfs.items() if symbol == sector_etf), "Settore peer")
+        adjusted_peers = {
+            symbol: series.reindex(target_series.index).pct_change(fill_method=None)
+            for symbol, series in peer_series.items() if series.attrs.get("priceBasis") == "adjusted"
+        }
+        if len(adjusted_peers) >= 2:
+            peer_daily = pd.DataFrame(adjusted_peers)
+            enough_peers = peer_daily.notna().sum(axis=1).ge(max(2, int(np.ceil(len(adjusted_peers) * 0.8))))
+            basket = (1 + peer_daily.mean(axis=1).where(enough_peers)).cumprod() * 100
+            signal_factors["Settore peer"] = basket
+            if signal_sector not in signal_factors:
+                signal_sector = "Settore peer"
+        if cross_market:
+            signal_factors = {name: _heatmap_prior_close(series, target_series.index)
+                              for name, series in signal_factors.items()}
+        signal_block = currency_block
+        if target_series.attrs.get("priceBasis") != "adjusted":
+            signal_block = "Prezzi rettificati del titolo non disponibili: split e dividendi impediscono una stima confrontabile."
+        peer_sector_series = {}
+        for key, lag in horizons.items():
+            target_returns = _heatmap_relation_returns(target_series, lag)
+            peer_returns = {symbol: _heatmap_relation_returns(series, lag) for symbol, series in peer_series.items()}
+            for row in peer_rows:
+                symbol = normalize_ticker(row.get("symbol"))
+                if symbol not in peer_returns:
+                    continue
+                stats = _heatmap_pair_stats(target_returns, peer_returns[symbol], lag)
+                stats.update({"symbol": symbol, "name": row.get("name") or symbol, "sector": sector, "marketCap": row.get("marketCap")})
+                peer_correlations[key].append(stats)
+            peer_correlations[key].sort(key=lambda item: abs(item.get("correlation") or 0), reverse=True)
+            if peer_returns:
+                peer_frame = pd.concat(peer_returns.values(), axis=1, join="outer").mean(axis=1, skipna=True).dropna()
+                peer_sector_series[key] = peer_frame
+            else:
+                peer_sector_series[key] = pd.Series(dtype=float)
+            factor_returns = {}
+            if "SPY" in histories:
+                factor_returns["Mercato · SPY"] = _heatmap_relation_returns(histories["SPY"], lag)
+            if sector_etf and sector_etf in histories:
+                factor_returns[sector] = _heatmap_relation_returns(histories[sector_etf], lag)
+                if not peer_sector_series[key].empty:
+                    # Keep a cross-sectional peer factor in addition to the
+                    # ETF proxy, so the model also uses the actual heat-map
+                    # constituents of the target's sector.
+                    factor_returns[f"{sector} · peer average"] = peer_sector_series[key]
+            elif not peer_sector_series[key].empty:
+                factor_returns[f"{sector} · peer average"] = peer_sector_series[key]
+            sector_reference_returns = factor_returns.get(sector)
+            if sector_reference_returns is None or sector_reference_returns.empty:
+                sector_reference_returns = peer_sector_series[key]
+            for label, symbol in sector_etfs.items():
+                # Exclude the own-sector ETF by symbol as well as by label:
+                # TradingView may spell the same sector as "Health Care" or
+                # "Healthcare", while both map to XLV.
+                if symbol in histories and symbol != sector_etf:
+                    factor_returns[label] = _heatmap_relation_returns(histories[symbol], lag)
+                    # The sector table describes the relationship between the
+                    # target's own sector factor and the other sector factors.
+                    # The target's stock-level sensitivity is exposed separately
+                    # through the ridge model below.
+                    stats = _heatmap_pair_stats(sector_reference_returns, factor_returns[label], lag)
+                    stats.update({"sector": label, "etf": symbol})
+                    sector_correlations[key].append(stats)
+            sector_correlations[key].sort(key=lambda item: abs(item.get("correlation") or 0), reverse=True)
+            models[key] = _heatmap_relation_ridge(target_returns, factor_returns)
+            if signal_block:
+                signals[key] = unavailable_signal(key, "incompatible_data", signal_block, signal_cost_bps)
+            else:
+                signals[key] = build_heatmap_signal(target_series, signal_factors, key,
+                                                   sector_factor=signal_sector, cost_bps=signal_cost_bps)
+        result = _json_safe({
+            "source": "TradingView heatmap + Yahoo Finance history",
+            "target": {"symbol": target_symbol, "name": target_row.get("name") or target_symbol, "sector": sector, "marketCap": target_row.get("marketCap"), "currency": currency, "quoteCurrency": quote_currency, "inHeatmap": target_in_heatmap},
+            "peerCount": len(peer_series),
+            "peerUniverseCount": len(peer_symbols),
+            "sectorReference": {
+                "sector": sector,
+                "etf": sector_etf if sector_etf in histories else None,
+                "source": "sector ETF" if sector_etf in histories else "peer average",
+            },
+            "horizons": horizons,
+            "peerCorrelations": peer_correlations,
+            "sectorCorrelations": sector_correlations,
+            "models": models,
+            "signals": signals,
+            "signalVersion": HEATMAP_SIGNAL_VERSION,
+            "dataQuality": {
+                "comparisonCurrency": currency,
+                "fx": fx_info,
+                "warnings": warnings,
+                "foreignFeatureTiming": "prior-calendar-date-max-4-days" if cross_market else "same-market-close",
+                "factorUniverse": "USA: ETF settoriali, SPY e peer della heatmap; non universo locale",
+                "requestedSymbols": len(symbols),
+                "availableHistories": len(histories),
+                "resolvedSymbols": resolved_symbols,
+                "lookback": "5y daily",
+                "priceBasis": {symbol: series.attrs.get("priceBasis") for symbol, series in histories.items()},
+                "signalFactorCount": len(signal_factors),
+                "peerClassification": provider_sector or sector,
+                "returnWindows": {"daily": "1 seduta", "monthly": "21 sedute", "annual": "252 sedute"},
+            },
+        })
+        _cache_set(heatmap_relations_cache, cache_key, result, max_size=64)
+        return jsonify(result)
+    except Exception as exc:
+        print("Errore heatmap relations:", exc)
+        return jsonify({"error": "Modello delle relazioni non disponibile."}), 502
+
+
 @app.route("/stock/<ticker>")
 def get_stock(ticker):
     raw_ticker = ticker
@@ -1663,7 +5198,7 @@ def get_stock(ticker):
     price_only = request.args.get("priceOnly", "false").lower() == "true"
     yf_interval = TF_MAPPING.get(tf, "1d")
     cache_symbol = (raw_ticker or "").strip().upper().replace(" ", "")
-    cache_key = f"{cache_symbol}:{yf_interval}:priceOnly={price_only}"
+    cache_key = f"v3:{cache_symbol}:{yf_interval}:priceOnly={price_only}"
     cache_entry = stock_response_cache.get(cache_key)
     if cache_entry:
         payload, ts = cache_entry
@@ -1682,15 +5217,34 @@ def get_stock(ticker):
         for cand in candidates:
             stock = yf.Ticker(cand)
             chart_meta = {}
-            daily_data = safe_history(stock, period="2d", interval="1d")
+            daily_data = safe_history(
+                stock,
+                period="2d",
+                interval="1d",
+                auto_adjust=False,
+            )
             if daily_data.empty:
-                daily_data = safe_history(stock, period="5d", interval="1d")
+                daily_data = safe_history(
+                    stock,
+                    period="5d",
+                    interval="1d",
+                    auto_adjust=False,
+                )
             if daily_data.empty:
-                daily_data = safe_history(stock, period="1mo", interval="1d")
+                daily_data = safe_history(
+                    stock,
+                    period="1mo",
+                    interval="1d",
+                    auto_adjust=False,
+                )
             if daily_data.empty:
                 daily_data = safe_download(
-                    cand, period="1mo", interval="1d",
-                    progress=False, threads=False
+                    cand,
+                    period="1mo",
+                    interval="1d",
+                    auto_adjust=False,
+                    progress=False,
+                    threads=False,
                 )
             if daily_data.empty:
                 daily_data, chart_meta = _fetch_chart_data(cand, "5d", "1d")
@@ -1700,6 +5254,13 @@ def get_stock(ticker):
 
         if daily_data.empty:
             return jsonify({"error": "Nessun dato disponibile"}), 404
+
+        daily_data, latest_chart_meta = _fetch_latest_daily_market_data(
+            ticker,
+            daily_data,
+        )
+        if latest_chart_meta:
+            chart_meta = {**chart_meta, **latest_chart_meta}
 
         # Evita stock.info come prima fonte: spesso lento/instabile
         info = {}
@@ -1715,21 +5276,19 @@ def get_stock(ticker):
         if daily_data.empty:
             return jsonify({"error": "Nessun dato disponibile"}), 404
 
-        current_price = float(daily_data["Close"].iloc[-1])
-        daily_low = float(daily_data["Low"].iloc[-1])
-        daily_high = float(daily_data["High"].iloc[-1])
-        prev_close = float(daily_data["Close"].iloc[-2]) if len(daily_data) >= 2 else None
-        daily_change = round(((current_price - prev_close) / prev_close) * 100, 2) if prev_close else None
+        price_details = _price_metadata(daily_data, chart_meta)
+        current_price = price_details["currentPrice"]
+        daily_low = price_details["dailyLow"]
+        daily_high = price_details["dailyHigh"]
+        daily_change = price_details["dailyChange"]
 
         if price_only:
-            payload = {
+            payload = _json_safe({
                 "info": {
-                    "currentPrice": current_price,
-                    "dailyChange": daily_change,
-                    "dailyLow": daily_low,
-                    "dailyHigh": daily_high
+                    **price_details,
+                    "currency": chart_meta.get("currency"),
                 }
-            }
+            })
             stock_response_cache[cache_key] = (payload, datetime.utcnow())
             return jsonify(payload)
 
@@ -1751,6 +5310,8 @@ def get_stock(ticker):
             chart_range = "10y"
 
         hist = _fetch_interval_history(ticker, stock, period, yf_interval, chart_range)
+        if yf_interval == "1d":
+            hist = _merge_daily_market_data(hist, daily_data)
         if hist.empty:
             # Fallback finale: usa daily_data per evitare 404 in frontend
             hist = daily_data.copy()
@@ -1758,6 +5319,7 @@ def get_stock(ticker):
                 hist = _resample_ohlc(hist, "W-FRI")
             elif yf_interval == "1mo":
                 hist = _resample_ohlc(hist, "ME")
+        hist = _prepare_ohlc_df(hist, require_complete=True)
         if hist.empty:
             return jsonify({"error": "Nessun dato disponibile"}), 404
 
@@ -1772,6 +5334,8 @@ def get_stock(ticker):
                 info["fiftyTwoWeekHigh"] = chart_meta.get("fiftyTwoWeekHigh")
             if info.get("volume") is None and chart_meta.get("regularMarketVolume") is not None:
                 info["volume"] = chart_meta.get("regularMarketVolume")
+            if not info.get("currency") and chart_meta.get("currency"):
+                info["currency"] = chart_meta.get("currency")
 
         # Candidati fondamentali: prima ticker richiesto, poi varianti normalizzate
         fund_symbols = []
@@ -1803,7 +5367,7 @@ def get_stock(ticker):
             "bookValue", "netIncomeToCommon",
             "averageVolume", "volume",
             "fiftyTwoWeekLow", "fiftyTwoWeekHigh",
-            "shortName", "sector"
+            "shortName", "sector", "currency"
         ]
 
         def has_missing(keys):
@@ -1833,6 +5397,10 @@ def get_stock(ticker):
                     return v
             return None
 
+        # Le metriche di performance devono essere sempre calcolate su chiusure
+        # giornaliere aggiustate, indipendentemente dal timeframe scelto nel grafico.
+        analytics_hist = _fetch_analytics_history(ticker, stock, period="6y")
+
         last_volume = None
         if "Volume" in daily_data.columns and not daily_data.empty:
             try:
@@ -1841,9 +5409,11 @@ def get_stock(ticker):
                 last_volume = None
 
         avg_volume_calc = None
-        if "Volume" in hist.columns and not hist.empty:
+        if "Volume" in analytics_hist.columns and not analytics_hist.empty:
             try:
-                avg_volume_calc = float(hist["Volume"].tail(30).mean())
+                avg_volume_calc = float(
+                    pd.to_numeric(analytics_hist["Volume"], errors="coerce").tail(30).mean()
+                )
             except Exception:
                 avg_volume_calc = None
         elif "Volume" in daily_data.columns and not daily_data.empty:
@@ -1852,7 +5422,7 @@ def get_stock(ticker):
             except Exception:
                 avg_volume_calc = None
 
-        year_hist = safe_history(stock, period="1y", interval="1d")
+        year_hist = safe_history(stock, period="1y", interval="1d", auto_adjust=False)
         if (year_hist is None) or year_hist.empty:
             year_hist = hist if (not hist.empty and yf_interval == "1d") else pd.DataFrame()
         if year_hist.empty:
@@ -1900,21 +5470,10 @@ def get_stock(ticker):
             except Exception:
                 trailing_eps = None
         forward_eps = pick(info.get("forwardEps"), info.get("epsForward"))
-        if forward_eps is None:
-            try:
-                growth = info.get("earningsGrowth") or info.get("earningsQuarterlyGrowth")
-                if growth is not None and trailing_eps is not None:
-                    forward_eps = float(trailing_eps) * (1 + float(growth))
-            except Exception:
-                forward_eps = None
-        if forward_eps is None and trailing_eps is not None:
-            forward_eps = trailing_eps
 
         pe_ratio = pick(info.get("trailingPE"))
         if pe_ratio is None and trailing_eps and trailing_eps > 0:
             pe_ratio = round(current_price / trailing_eps, 2)
-        if pe_ratio is None and forward_eps and forward_eps > 0:
-            pe_ratio = round(current_price / forward_eps, 2)
         if pe_ratio is not None and pe_ratio <= 0:
             pe_ratio = None
 
@@ -1973,23 +5532,27 @@ def get_stock(ticker):
             except Exception:
                 price_to_sales = None
 
+        benchmark_symbol = _benchmark_for_ticker(ticker)
         beta = info.get("beta")
+        beta_benchmark = None
+        beta_source = "provider" if beta is not None else None
         if beta is None:
             try:
-                t_hist_beta = None
-                if not hist.empty and yf_interval == "1d":
-                    t_hist_beta = hist.tail(252)
-                if t_hist_beta is None or t_hist_beta.empty:
-                    t_hist_beta = safe_history(stock, period="1y", interval="1d")
-                m_hist = safe_history(yf.Ticker("SPY"), period="1y", interval="1d")
-                if m_hist.empty:
-                    m_hist = safe_history(yf.Ticker("^GSPC"), period="1y", interval="1d")
+                t_hist_beta = analytics_hist.tail(260)
+                benchmark_stock = yf.Ticker(benchmark_symbol)
+                m_hist = _fetch_analytics_history(
+                    benchmark_symbol,
+                    benchmark_stock,
+                    period="2y",
+                ).tail(260)
                 if not t_hist_beta.empty and not m_hist.empty:
                     t_ret = t_hist_beta["Close"].pct_change().dropna()
                     m_ret = m_hist["Close"].pct_change().dropna()
                     t_ret, m_ret = t_ret.align(m_ret, join="inner")
                     if len(t_ret) > 10 and m_ret.var() > 0:
                         beta = round(t_ret.cov(m_ret) / m_ret.var(), 2)
+                        beta_benchmark = benchmark_symbol
+                        beta_source = "calculated"
             except Exception:
                 beta = None
 
@@ -2001,26 +5564,57 @@ def get_stock(ticker):
         if avg_volume is not None:
             info["averageVolume"] = avg_volume
 
+        chart_tail_limit = {
+            "60m": 480,
+            "240m": 240,
+            "1d": 260,
+            "1wk": 260,
+            "1mo": 240,
+        }.get(yf_interval, 260)
+        chart_hist = hist.tail(chart_tail_limit)
         ohlc_data = [
             {
                 "date": idx.strftime("%Y-%m-%d %H:%M") if "m" in yf_interval else idx.strftime("%Y-%m-%d"),
-                "open": float(row["Open"]),
-                "high": float(row["High"]),
-                "low": float(row["Low"]),
-                "close": float(row["Close"])
+                "open": round(float(row["Open"]), 6),
+                "high": round(float(row["High"]), 6),
+                "low": round(float(row["Low"]), 6),
+                "close": round(float(row["Close"]), 6)
             }
-            for idx, row in hist.iterrows()
+            for idx, row in chart_hist.iterrows()
         ]
 
-        closes = hist["Close"].tolist()
-        close_series = pd.Series(closes)
+        # Performance: prezzi adjusted giornalieri e finestre temporali reali.
+        if not analytics_hist.empty:
+            close_series = pd.to_numeric(
+                analytics_hist["Close"],
+                errors="coerce",
+            ).dropna()
+            close_series = close_series[
+                ~close_series.index.duplicated(keep="last")
+            ].sort_index()
+        else:
+            close_series = pd.Series(dtype="float64")
 
-        # Performance
-        def calc_return(days):
-            if len(closes) > days:
-                old = closes[-days - 1]
-                return round(((closes[-1] - old) / old) * 100, 2)
-            return None
+        performance_history = [
+            {
+                "date": idx.strftime("%Y-%m-%d"),
+                "close": round(float(value), 6),
+            }
+            for idx, value in close_series.items()
+        ]
+
+        def calc_period_return(offset):
+            if len(close_series) < 2 or not isinstance(close_series.index, pd.DatetimeIndex):
+                return None
+            target_date = close_series.index[-1] - offset
+            historical = close_series[close_series.index <= target_date]
+            if historical.empty:
+                return None
+            old_price = float(historical.iloc[-1])
+            latest_price = float(close_series.iloc[-1])
+            if old_price <= 0:
+                return None
+            return round(((latest_price / old_price) - 1) * 100, 2)
 
         daily_returns = close_series.pct_change().dropna()
         trading_days = 252
@@ -2030,49 +5624,69 @@ def get_stock(ticker):
                 return None
             return round(returns.std() * np.sqrt(trading_days) * 100, 2)
 
-        def annualized_return(returns):
-            if returns is None or len(returns) == 0:
-                return None
-            return (1 + returns.mean()) ** trading_days - 1
-
         volatility = annualized_vol(daily_returns)
         volatility_30d = annualized_vol(daily_returns.tail(30)) if len(daily_returns) >= 30 else None
-        volatility_1y = annualized_vol(daily_returns.tail(252)) if len(daily_returns) >= 252 else None
+
+        if len(close_series) >= 2 and isinstance(close_series.index, pd.DatetimeIndex):
+            one_year_start = close_series.index[-1] - pd.DateOffset(years=1)
+            returns_1y = daily_returns[daily_returns.index >= one_year_start]
+            prices_1y = close_series[close_series.index >= one_year_start]
+        else:
+            returns_1y = pd.Series(dtype="float64")
+            prices_1y = pd.Series(dtype="float64")
+
+        volatility_1y = annualized_vol(returns_1y)
 
         max_drawdown_1y = None
-        if len(close_series) >= 252:
-            last_year = close_series.tail(252)
-            roll_max = last_year.cummax()
-            drawdown = (last_year / roll_max) - 1
+        if len(prices_1y) >= 2:
+            roll_max = prices_1y.cummax()
+            drawdown = (prices_1y / roll_max) - 1
             max_drawdown_1y = round(drawdown.min() * 100, 2)
 
-        risk_free_rate = 0.01
-        returns_1y = daily_returns.tail(252) if len(daily_returns) >= 252 else daily_returns
-        ann_ret_1y = annualized_return(returns_1y)
-        vol_1y_decimal = (volatility_1y / 100) if volatility_1y is not None else None
+        try:
+            risk_free_rate = float(os.environ.get("SEARCH_RISK_FREE_RATE", "0"))
+            if not np.isfinite(risk_free_rate) or risk_free_rate <= -1:
+                risk_free_rate = 0.0
+        except (TypeError, ValueError):
+            risk_free_rate = 0.0
+        daily_risk_free_rate = (1 + risk_free_rate) ** (1 / trading_days) - 1
+        excess_returns_1y = returns_1y - daily_risk_free_rate
 
         sharpe_ratio = None
-        if ann_ret_1y is not None and vol_1y_decimal and vol_1y_decimal > 0:
-            sharpe_ratio = round((ann_ret_1y - risk_free_rate) / vol_1y_decimal, 2)
+        if len(excess_returns_1y) >= 2:
+            returns_std = returns_1y.std()
+            if returns_std and returns_std > 0:
+                sharpe_ratio = round(
+                    (excess_returns_1y.mean() / returns_std) * np.sqrt(trading_days),
+                    2,
+                )
 
-        downside = returns_1y[returns_1y < 0]
-        downside_dev = downside.std() * np.sqrt(trading_days) if len(downside) > 1 else None
         sortino_ratio = None
-        if ann_ret_1y is not None and downside_dev and downside_dev > 0:
-            sortino_ratio = round((ann_ret_1y - risk_free_rate) / downside_dev, 2)
+        if len(excess_returns_1y) >= 2:
+            downside_returns = np.minimum(excess_returns_1y, 0)
+            downside_deviation = (
+                np.sqrt(np.mean(np.square(downside_returns))) * np.sqrt(trading_days)
+            )
+            if downside_deviation and downside_deviation > 0:
+                annualized_excess_return = excess_returns_1y.mean() * trading_days
+                sortino_ratio = round(
+                    annualized_excess_return / downside_deviation,
+                    2,
+                )
 
         performance = {
-            "return1Y": calc_return(252),
-            "return3Y": calc_return(252*3),
-            "return5Y": calc_return(252*5),
+            "return1Y": calc_period_return(pd.DateOffset(years=1)),
+            "return3Y": calc_period_return(pd.DateOffset(years=3)),
+            "return5Y": calc_period_return(pd.DateOffset(years=5)),
             "volatility": volatility,
-            "momentum1M": calc_return(21),
-            "momentum3M": calc_return(63),
+            "momentum1M": calc_period_return(pd.DateOffset(months=1)),
+            "momentum3M": calc_period_return(pd.DateOffset(months=3)),
             "volatility30D": volatility_30d,
             "volatility1Y": volatility_1y,
             "maxDrawdown1Y": max_drawdown_1y,
             "sharpeRatio": sharpe_ratio,
-            "sortinoRatio": sortino_ratio
+            "sortinoRatio": sortino_ratio,
+            "riskFreeRate": round(risk_free_rate * 100, 4),
         }
 
         # --- Risk index (composite) ---
@@ -2085,7 +5699,7 @@ def get_stock(ticker):
         def _clamp01(v):
             return max(0.0, min(1.0, v))
 
-        vol1y = _to_num(performance.get("volatility"))
+        vol1y = _to_num(performance.get("volatility1Y"))
         vol30 = _to_num(performance.get("volatility30D"))
         drawdown = _to_num(performance.get("maxDrawdown1Y"))
         beta = _to_num(info.get("beta"))
@@ -2093,9 +5707,9 @@ def get_stock(ticker):
         sortino = _to_num(performance.get("sortinoRatio"))
         avg_volume_num = _to_num(avg_volume) or _to_num(volume)
         market_cap_num = _to_num(market_cap)
-        avg_dollar_volume = None
+        avg_traded_value = None
         if avg_volume_num is not None and current_price is not None:
-            avg_dollar_volume = avg_volume_num * current_price
+            avg_traded_value = avg_volume_num * current_price
         vol_regime = vol30 / vol1y if (vol30 is not None and vol1y is not None and vol1y > 0) else None
 
         vol_score = _clamp01((vol1y - 15) / 25) if vol1y is not None else None
@@ -2105,45 +5719,27 @@ def get_stock(ticker):
         sharpe_score = _clamp01((1.2 - sharpe) / 1.2) if sharpe is not None else None
         sortino_score = _clamp01((1.4 - sortino) / 1.4) if sortino is not None else None
 
-        def _log10(v):
-            return np.log10(v) if v and v > 0 else None
-
-        liquidity_score = None
-        liquidity_base = avg_dollar_volume if avg_dollar_volume is not None else avg_volume_num
-        if liquidity_base is not None:
-            lv = _log10(liquidity_base)
-            if lv is not None:
-                low = 6.3 if avg_dollar_volume is not None else 5.5
-                high = 7.3 if avg_dollar_volume is not None else 6.5
-                liquidity_score = _clamp01((high - lv) / (high - low))
-
-        size_score = None
-        if market_cap_num is not None:
-            lv = _log10(market_cap_num)
-            if lv is not None:
-                low = 9.3   # 2e9
-                high = 10.0 # 1e10
-                size_score = _clamp01((high - lv) / (high - low))
-
         regime_score = _clamp01((vol_regime - 1) / 0.6) if vol_regime is not None else None
 
+        # La versione v2 usa soltanto misure indipendenti dalla valuta.
+        # Liquidita' e capitalizzazione restano informative ma non alterano il punteggio.
         parts = [
-            (vol_score, 0.20),
+            (vol_score, 0.25),
             (vol30_score, 0.10),
-            (dd_score, 0.20),
+            (dd_score, 0.25),
             (beta_score, 0.10),
             (sharpe_score, 0.10),
             (sortino_score, 0.10),
-            (liquidity_score, 0.10),
-            (size_score, 0.05),
-            (regime_score, 0.05),
+            (regime_score, 0.10),
         ]
         parts = [(v, w) for v, w in parts if v is not None]
         if parts:
             weight_sum = sum(w for _, w in parts)
             risk_index = round((sum(v * w for v, w in parts) / weight_sum) * 100)
+            risk_coverage = round(weight_sum * 100)
         else:
             risk_index = None
+            risk_coverage = 0
 
         if risk_index is None:
             risk_level = "N/D"
@@ -2155,9 +5751,11 @@ def get_stock(ticker):
             risk_level = "Basso"
 
         risk = {
-            "version": "v1",
+            "version": "v2",
+            "methodology": "Indice proprietario basato su volatilita, drawdown, beta e rendimenti corretti per il rischio.",
             "level": risk_level,
             "index": risk_index,
+            "coverage": risk_coverage,
             "metrics": {
                 "vol1y": vol1y,
                 "vol30": vol30,
@@ -2165,21 +5763,40 @@ def get_stock(ticker):
                 "beta": beta,
                 "sharpe": sharpe,
                 "sortino": sortino,
-                "avgDollarVolume": avg_dollar_volume,
+                "avgTradedValue": avg_traded_value,
                 "avgVolume": avg_volume_num,
                 "marketCap": market_cap_num,
-                "volRegime": vol_regime
+                "volRegime": vol_regime,
+                "benchmarkSymbol": beta_benchmark,
+                "betaSource": beta_source,
+                "riskFreeRate": performance.get("riskFreeRate"),
             }
         }
 
-        response = {
+        currency = str(
+            pick(
+                fast_info.get("currency"),
+                info.get("currency"),
+                chart_meta.get("currency"),
+            )
+            or ""
+        ).strip()
+
+        response = _json_safe({
             "info": {
                 "shortName": info.get("shortName") or ticker.upper(),
                 "sector": info.get("sector") or "N/A",
+                "currency": currency or None,
                 "currentPrice": current_price,
+                "previousClose": price_details["previousClose"],
                 "dailyLow": daily_low,
                 "dailyHigh": daily_high,
+                "dailyOpen": price_details["dailyOpen"],
                 "dailyChange": daily_change,
+                "priceDate": price_details["priceDate"],
+                "priceTimestamp": price_details["priceTimestamp"],
+                "priceSource": price_details["priceSource"],
+                "marketState": price_details["marketState"],
                 "marketCap": market_cap,
                 "peRatio": pe_ratio,
                 "forwardPE": forward_pe,
@@ -2196,9 +5813,10 @@ def get_stock(ticker):
                 "priceToBook": price_to_book,
             },
             "ohlc": ohlc_data,
+            "performanceHistory": performance_history,
             "performance": performance,
             "risk": risk
-        }
+        })
 
         stock_response_cache[cache_key] = (response, datetime.utcnow())
         return jsonify(response)
@@ -2208,292 +5826,708 @@ def get_stock(ticker):
         return jsonify({"error": "Errore Server"}), 500
 
 
+@app.route("/stock/<ticker>/financials")
+def get_stock_financials(ticker):
+    raw_ticker = ticker
+    frequency = (request.args.get("frequency") or "annual").strip().lower()
+    if frequency not in {"annual", "quarterly"}:
+        return jsonify({"error": "Frequenza non valida"}), 400
+
+    cache_symbol = (raw_ticker or "").strip().upper().replace(" ", "")
+    cache_key = f"{cache_symbol}:{frequency}"
+    cached = _cache_get(financials_cache, cache_key, FINANCIALS_CACHE_TTL)
+    if cached is not None:
+        return jsonify(cached)
+
+    try:
+        selected_symbol = None
+        dated_values = {}
+        trailing_values = {}
+        for candidate in ticker_candidates(raw_ticker):
+            candidate_values, candidate_trailing = _fetch_financial_timeseries(
+                candidate,
+                frequency,
+            )
+            if candidate_values:
+                selected_symbol = candidate
+                dated_values = candidate_values
+                trailing_values = candidate_trailing
+                break
+
+        if not selected_symbol:
+            return jsonify({"error": "Dati di bilancio non disponibili"}), 404
+
+        statements = _serialize_financial_statements(
+            dated_values,
+            trailing_values,
+            frequency,
+        )
+        if not any(statement["rows"] for statement in statements.values()):
+            return jsonify({"error": "Dati di bilancio non disponibili"}), 404
+
+        _, chart_meta = _fetch_chart_data(selected_symbol, "5d", "1d")
+        chart_meta = chart_meta or {}
+        quote_fields = _fetch_quote_fields(selected_symbol)
+        official_filings = _fetch_sec_filings(selected_symbol)
+
+        current_price = _financial_number(
+            chart_meta.get("regularMarketPrice")
+            or quote_fields.get("regularMarketPrice")
+        )
+        previous_close = _financial_number(
+            chart_meta.get("previousClose")
+            or chart_meta.get("chartPreviousClose")
+            or quote_fields.get("regularMarketPreviousClose")
+        )
+        daily_change = None
+        if current_price is not None and previous_close not in (None, 0):
+            daily_change = round(
+                ((current_price / previous_close) - 1) * 100,
+                2,
+            )
+
+        payload = {
+            "symbol": selected_symbol,
+            "frequency": frequency,
+            "unit": "thousands",
+            "currency": (
+                chart_meta.get("currency")
+                or quote_fields.get("currency")
+                or None
+            ),
+            "quote": {
+                "shortName": (
+                    chart_meta.get("shortName")
+                    or chart_meta.get("longName")
+                    or quote_fields.get("shortName")
+                    or selected_symbol
+                ),
+                "exchange": (
+                    chart_meta.get("fullExchangeName")
+                    or chart_meta.get("exchangeName")
+                    or ""
+                ),
+                "currentPrice": current_price,
+                "dailyChange": daily_change,
+            },
+            "statements": statements,
+            "officialFilings": official_filings,
+            "dataProvenance": {
+                "statementPrimary": "Yahoo Finance",
+                "statementFallback": (
+                    "SEC Company Facts"
+                    if official_filings.get("cik")
+                    else None
+                ),
+                "filingsProvider": "SEC EDGAR",
+                "method": (
+                    "I valori Yahoo disponibili hanno priorità; SEC Company "
+                    "Facts completa solo voci o esercizi annuali mancanti."
+                ),
+            },
+        }
+        _cache_set(financials_cache, cache_key, payload, max_size=160)
+        return jsonify(payload)
+    except Exception as exc:
+        print("Errore dati bilancio:", exc)
+        return jsonify({"error": "Errore durante il caricamento del bilancio"}), 500
+
+
+@app.route("/stock/<ticker>/fundamental-return-forecast")
+def get_fundamental_return_forecast(ticker):
+    """Previsione ML da filing SEC point-in-time per 1, 3 e 12 mesi."""
+
+    artifact = _load_fundamental_model_artifact()
+    if artifact is None:
+        return jsonify(
+            {
+                "status": "unavailable",
+                "error": "Modello fondamentale non ancora addestrato.",
+                "reason": (
+                    "Esegui backend/train_fundamental_model.py per creare un "
+                    "artifact validato temporalmente."
+                ),
+            }
+        ), 503
+
+    cache_symbol = (ticker or "").strip().upper().replace(" ", "")
+    model_cache_key = (
+        f"{cache_symbol}:"
+        f"{artifact.get('modelVersion') or 'unknown'}:"
+        f"{artifact.get('generatedAt') or 'unknown'}"
+    )
+    cached = _cache_get(
+        fundamental_forecast_cache,
+        model_cache_key,
+        FUNDAMENTAL_FORECAST_CACHE_TTL,
+    )
+    if cached is not None:
+        return jsonify(cached)
+
+    try:
+        dataset_metadata = artifact.get("dataset", {}) or {}
+        filing_policy = dataset_metadata.get("filingPolicy", {}) or {}
+        target_policy = dataset_metadata.get("targetPolicy", {}) or {}
+        now = datetime.utcnow()
+        security_row, has_runtime_security_master = _resolve_artifact_security(
+            artifact,
+            cache_symbol,
+            now,
+        )
+        if has_runtime_security_master and security_row is None:
+            return jsonify(
+                {
+                    "status": "unavailable",
+                    "symbol": cache_symbol,
+                    "error": "Titolo non presente nel security master del modello.",
+                    "reason": (
+                        "L'inferenza è sospesa per evitare survivorship bias o "
+                        "l'uso di un ticker fuori dal relativo intervallo storico."
+                    ),
+                }
+            ), 422
+        filing_frequency = str(
+            filing_policy.get("frequency") or "annual"
+        ).strip().lower()
+        include_quarterly = filing_frequency == "quarterly"
+        target_kind = str(target_policy.get("selected") or "raw").strip().lower()
+        selected_symbol = None
+        companyfacts = {}
+        submissions = {}
+        vintages = []
+        runtime_candidates = []
+        if security_row:
+            runtime_candidates.extend(
+                [
+                    security_row.get("price_ticker"),
+                    security_row.get("ticker"),
+                    security_row.get("current_ticker"),
+                    security_row.get("canonical_ticker"),
+                ]
+            )
+        candidate_symbols = []
+        for candidate in [*runtime_candidates, *ticker_candidates(ticker)]:
+            normalized_candidate = str(candidate or "").strip().upper()
+            if normalized_candidate and normalized_candidate not in candidate_symbols:
+                candidate_symbols.append(normalized_candidate)
+        for candidate in candidate_symbols:
+            candidate_companyfacts = _fetch_sec_companyfacts_payload(candidate)
+            candidate_submissions = _fetch_sec_submissions_payload(candidate)
+            filing_index = build_ml_filing_index(
+                candidate_submissions,
+                include_quarterly=include_quarterly,
+            )
+            candidate_vintages = (
+                extract_ml_filing_vintages(
+                    candidate_companyfacts,
+                    filing_index,
+                    include_quarterly=True,
+                )
+                if include_quarterly
+                else extract_ml_annual_vintages(
+                    candidate_companyfacts,
+                    filing_index,
+                )
+            )
+            if candidate_vintages:
+                selected_symbol = candidate
+                companyfacts = candidate_companyfacts
+                submissions = candidate_submissions
+                vintages = candidate_vintages
+                break
+
+        if not selected_symbol:
+            return jsonify(
+                {
+                    "status": "unavailable",
+                    "symbol": cache_symbol,
+                    "error": "Filing SEC point-in-time non disponibili.",
+                    "reason": (
+                        "La prima versione copre emittenti statunitensi con "
+                        + (
+                            "filing 10-K/10-Q US-GAAP."
+                            if include_quarterly
+                            else "filing 10-K US-GAAP."
+                        )
+                    ),
+                }
+            ), 404
+
+        try:
+            sic = int(submissions.get("sic"))
+        except (TypeError, ValueError):
+            sic = None
+        if sic is not None and 6000 <= sic <= 6799:
+            return jsonify(
+                {
+                    "status": "unavailable",
+                    "symbol": selected_symbol,
+                    "error": "Modello non applicabile a questo settore.",
+                    "reason": (
+                        "Banche, assicurazioni, fondi e REIT richiedono "
+                        "feature contabili e un modello dedicati."
+                    ),
+                }
+            ), 422
+
+        current_vintage, previous_vintage = latest_ml_usable_vintage(vintages)
+        if current_vintage is None:
+            return jsonify(
+                {
+                    "status": "unavailable",
+                    "symbol": selected_symbol,
+                    "error": "Nessun filing utilizzabile alla data odierna.",
+                }
+            ), 404
+
+        chart, chart_meta = _fetch_chart_data(selected_symbol, "1mo", "1d")
+        chart_meta = chart_meta or {}
+        quote_fields = _fetch_quote_fields(selected_symbol)
+        raw_price = _financial_number(chart_meta.get("regularMarketPrice"))
+        price_source = "Yahoo Finance"
+        price_as_of = None
+        if raw_price is None:
+            raw_price = _financial_number(
+                quote_fields.get("regularMarketPrice")
+            )
+        if raw_price is None and not chart.empty:
+            raw_price = _financial_number(chart["Close"].iloc[-1])
+        if raw_price is not None and not chart.empty:
+            try:
+                price_as_of = pd.Timestamp(chart.index[-1]).date().isoformat()
+            except (TypeError, ValueError):
+                price_as_of = None
+        if raw_price is None:
+            raw_price, price_as_of = _latest_fundamental_training_price(
+                selected_symbol
+            )
+            if raw_price is not None:
+                price_source = "Cache locale del training"
+        if raw_price is None or raw_price <= 0:
+            return jsonify(
+                {
+                    "status": "unavailable",
+                    "symbol": selected_symbol,
+                    "error": "Prezzo corrente non disponibile per l'inferenza.",
+                }
+            ), 503
+
+        filing_age_days = max(0, (now - current_vintage["acceptedAt"]).days)
+        current_form = str(current_vintage.get("form") or "").upper()
+        is_quarterly_filing = current_form == "10-Q"
+        stale_warning_days = 190 if is_quarterly_filing else 400
+        stale_limit_days = 280 if is_quarterly_filing else 550
+        features = build_feature_vector(
+            current_vintage["metrics"],
+            (
+                previous_vintage["metrics"]
+                if previous_vintage is not None
+                else None
+            ),
+            raw_price=raw_price,
+            filing_age_days=filing_age_days,
+        )
+        runtime_features, runtime_feature_audit = _build_runtime_v5_features(
+            artifact,
+            selected_symbol,
+            quote_fields,
+            chart_meta,
+            submissions,
+            security_row,
+            now,
+        )
+        features.update(runtime_features)
+        inference = predict_from_artifact(artifact, features)
+        out_of_distribution = _fundamental_model_ood(features, artifact)
+        coverage = (
+            inference.get("dataQuality", {}).get("featureCoveragePct")
+            or 0
+        )
+        warnings = []
+        warning_objects = []
+
+        def add_forecast_warning(
+            code,
+            title,
+            detail,
+            *,
+            horizons=None,
+            severity="warning",
+        ):
+            warnings.append(detail)
+            warning_objects.append(
+                {
+                    "code": code,
+                    "severity": severity,
+                    "title": title,
+                    "detail": detail,
+                    "horizons": list(horizons or []),
+                }
+            )
+
+        if filing_age_days > stale_warning_days:
+            add_forecast_warning(
+                "stale-filing",
+                "Filing datato",
+                f"Il filing {current_form or 'usato'} ha più di "
+                f"{stale_warning_days} giorni: i fondamentali sono datati.",
+            )
+        if coverage < 65:
+            add_forecast_warning(
+                "low-feature-coverage",
+                "Copertura feature limitata",
+                "Copertura delle feature inferiore al 65%: stima più fragile."
+            )
+        missing_runtime_features = runtime_feature_audit.get(
+            "missingRequiredFeatures", []
+        )
+        if missing_runtime_features:
+            add_forecast_warning(
+                "missing-v5-features",
+                "Feature market/event incomplete",
+                f"{len(missing_runtime_features)} feature v5 richieste non sono "
+                "disponibili con un timestamp verificabile; il modello usa "
+                "missingness esplicita.",
+            )
+        if (
+            runtime_feature_audit.get("enabled")
+            and not has_runtime_security_master
+            and runtime_feature_audit.get("requiredCategoricalFeatures")
+        ):
+            add_forecast_warning(
+                "unverified-live-security-classification",
+                "Classificazione security master non verificata",
+                "Settore e classificazione live provengono dai metadati correnti; "
+                "l'artifact non incorpora un security master storico portabile.",
+            )
+        if out_of_distribution:
+            add_forecast_warning(
+                "out-of-distribution",
+                "Dati fuori distribuzione",
+                f"{len(out_of_distribution)} feature sono fuori dal range "
+                "1°-99° percentile osservato nel training.",
+            )
+        runtime_fallbacks = (
+            inference.get("dataQuality", {}).get("runtimeFallbacks") or []
+        )
+        if runtime_fallbacks:
+            add_forecast_warning(
+                "runtime-fallback",
+                "Fallback del modello",
+                "Il challenger selezionato non era caricabile nel runtime: "
+                "è stato usato il fallback Ridge per gli orizzonti indicati.",
+                horizons=[
+                    item.get("horizon")
+                    for item in runtime_fallbacks
+                    if item.get("horizon")
+                ],
+            )
+        prospective_horizons = []
+        for horizon, model in (artifact.get("models") or {}).items():
+            selection = (
+                model.get("selection")
+                if isinstance(model, dict)
+                else {}
+            ) or {}
+            if (
+                selection.get("rankIcTradeoffApplied")
+                and selection.get("policyValidationStatus")
+                == "prospective-confirmation-required"
+            ):
+                horizon_metadata = (
+                    artifact.get("horizons", {}).get(horizon, {})
+                )
+                prospective_horizons.append(
+                    horizon_metadata.get("label") or horizon
+                )
+        if prospective_horizons:
+            add_forecast_warning(
+                "prospective-confirmation",
+                "Conferma prospettica richiesta",
+                "La promozione basata sulla nuova regola relativa del Rank IC "
+                "è esplorativa per: "
+                + ", ".join(prospective_horizons)
+                + ". Richiede conferma su una finestra futura mai osservata.",
+                horizons=prospective_horizons,
+            )
+        validation_statuses = {}
+        for prediction in inference.get("predictions", []):
+            validation_status = (
+                prediction.get("validationStatus")
+                or (prediction.get("performance") or {}).get("validationStatus")
+            )
+            if validation_status and prediction.get("horizon"):
+                validation_statuses.setdefault(validation_status, []).append(
+                    prediction["horizon"]
+                )
+        prospective_status_horizons = validation_statuses.get(
+            "prospectiveConfirmationRequired",
+            [],
+        )
+        if prospective_status_horizons and not prospective_horizons:
+            add_forecast_warning(
+                "prospective-confirmation",
+                "Conferma prospettica richiesta",
+                "La selezione è esplorativa finché non matura una finestra "
+                "futura mai osservata.",
+                horizons=prospective_status_horizons,
+            )
+        if validation_statuses.get("holdoutNotConfirmed"):
+            add_forecast_warning(
+                "holdout-not-confirmed",
+                "Holdout finale non confermato",
+                "Il segnale osservato nello sviluppo non è stato confermato "
+                "nella finestra temporale finale.",
+                horizons=validation_statuses["holdoutNotConfirmed"],
+            )
+        if validation_statuses.get("legacyArtifact"):
+            add_forecast_warning(
+                "legacy-validation",
+                "Validazione precedente alla v4",
+                "L'artifact attivo non contiene ancora IC cross-sectional, "
+                "bootstrap a blocchi e robustezza non-overlapping.",
+                horizons=validation_statuses["legacyArtifact"],
+            )
+        if price_source == "Cache locale del training":
+            add_forecast_warning(
+                "stale-price",
+                "Prezzo live non disponibile",
+                "Prezzo live non disponibile: per le feature di valutazione "
+                "è stata usata l'ultima chiusura presente nella cache locale.",
+            )
+        unpublished_horizons = [
+            prediction.get("horizon")
+            for prediction in inference.get("predictions", [])
+            if not prediction.get("publishable") and prediction.get("horizon")
+        ]
+        if unpublished_horizons:
+            add_forecast_warning(
+                "baseline-not-beaten",
+                "Baseline non superata",
+                "Uno o più orizzonti non hanno superato la baseline nulla "
+                "nel backtest walk-forward.",
+                horizons=unpublished_horizons,
+            )
+        undercovered_intervals = [
+            prediction.get("horizon")
+            for prediction in inference.get("predictions", [])
+            if _financial_number(
+                (prediction.get("performance") or {}).get(
+                    "interval80CoveragePct"
+                )
+            )
+            is not None
+            and float(
+                prediction["performance"]["interval80CoveragePct"]
+            )
+            < 75.0
+        ]
+        if undercovered_intervals:
+            add_forecast_warning(
+                "interval-undercoverage",
+                "Intervallo sottocalibrato",
+                "L'intervallo nominale all'80% ha coperto meno del 75% "
+                "dell'holdout per: "
+                + ", ".join(undercovered_intervals)
+                + ".",
+                horizons=undercovered_intervals,
+            )
+        if current_vintage.get("acceptanceFallback"):
+            add_forecast_warning(
+                "filing-time-fallback",
+                "Ora del filing stimata",
+                "Ora di accettazione non disponibile: è stata usata la fine "
+                "del giorno di deposito come stima conservativa.",
+            )
+
+        cik_value = submissions.get("cik") or companyfacts.get("cik")
+        try:
+            cik = f"{int(cik_value):010d}"
+        except (TypeError, ValueError):
+            cik = None
+        accession = current_vintage.get("accessionNumber")
+        filing_url = None
+        if cik and accession:
+            filing_url = (
+                "https://www.sec.gov/Archives/edgar/data/"
+                f"{int(cik)}/{str(accession).replace('-', '')}/"
+                f"{accession}-index.html"
+            )
+
+        status = inference.get("status") or "limited"
+        if filing_age_days > stale_limit_days or coverage < 45:
+            status = "limited"
+        payload = _json_safe(
+            {
+                "status": status,
+                "symbol": selected_symbol,
+                "companyName": (
+                    submissions.get("name")
+                    or companyfacts.get("entityName")
+                    or selected_symbol
+                ),
+                "modelVersion": artifact.get("modelVersion"),
+                "modelAsOf": artifact.get("generatedAt"),
+                "modelSummary": artifact.get("modelSummary", {}),
+                "predictions": inference.get("predictions", []),
+                "drivers": inference.get("drivers", {}),
+                "driversByHorizon": inference.get("driversByHorizon", {}),
+                "dataQuality": {
+                    **inference.get("dataQuality", {}),
+                    "outOfDistributionFeatures": out_of_distribution,
+                    "runtimeFeatureAudit": runtime_feature_audit,
+                    "filingMetricCoveragePct": (
+                        float(current_vintage.get("metricCoverage") or 0) * 100
+                    ),
+                    "priceSource": price_source,
+                    "priceAsOf": price_as_of,
+                    "warnings": warnings,
+                    "warningObjects": warning_objects,
+                },
+                "filing": {
+                    "form": current_vintage.get("form"),
+                    "frequency": (
+                        current_vintage.get("filingFrequency")
+                        or ("quarterly" if is_quarterly_filing else "annual")
+                    ),
+                    "reportDate": current_vintage.get("reportDate"),
+                    "acceptedAt": current_vintage.get("acceptedAtIso"),
+                    "accessionNumber": accession,
+                    "filingAgeDays": filing_age_days,
+                    "url": filing_url,
+                },
+                "dataset": {
+                    "rows": artifact.get("dataset", {}).get("rows"),
+                    "issuers": artifact.get("dataset", {}).get("issuers"),
+                    "algorithmsEvaluated": artifact.get("dataset", {}).get(
+                        "algorithmsEvaluated",
+                        [],
+                    ),
+                    "trainingEnd": max(
+                        (
+                            model.get("trainingEnd") or ""
+                            for model in artifact.get("models", {}).values()
+                        ),
+                        default=None,
+                    ),
+                    "targetLabel": (
+                        artifact.get("dataset", {}).get("targetLabel")
+                        or artifact.get("methodology", {}).get("target")
+                    ),
+                    "targetKind": target_kind,
+                    "targetBenchmarks": target_policy.get("benchmarks", {}),
+                    "securityMaster": dataset_metadata.get(
+                        "universeAudit", {}
+                    ),
+                    "filingFrequency": filing_frequency,
+                    "validationVersion": artifact.get("validationVersion"),
+                },
+                "methodology": artifact.get("methodology", {}),
+                "limitations": artifact.get("dataset", {}).get(
+                    "knownLimitations",
+                    [],
+                ),
+                "disclaimer": (
+                    "Stima probabilistica di ricerca, non una certezza né una "
+                    "raccomandazione di acquisto o vendita."
+                ),
+            }
+        )
+        _cache_set(
+            fundamental_forecast_cache,
+            model_cache_key,
+            payload,
+            max_size=160,
+        )
+        return jsonify(payload)
+    except Exception as exc:
+        print("Errore previsione fondamentale:", exc)
+        return jsonify(
+            {
+                "status": "unavailable",
+                "symbol": cache_symbol,
+                "error": "Errore durante la previsione fondamentale.",
+            }
+        ), 500
+
+
+# -------------------------------
+# Ricerca quantitativa avanzata
+# -------------------------------
+@app.route("/stock/<ticker>/quantitative-research")
+def get_quantitative_research(ticker):
+    symbol = (ticker or "").strip().upper().replace(" ", "")
+    artifact = _load_fundamental_model_artifact() or {}
+    cache_key = f"{symbol}:{artifact.get('modelVersion') or 'none'}"
+    cached = _cache_get(quantitative_research_cache, cache_key, QUANTITATIVE_RESEARCH_CACHE_TTL)
+    if cached is not None:
+        return jsonify(cached)
+    try:
+        chart, _meta = _fetch_chart_data(symbol, "5y", "1d")
+        returns = []
+        if isinstance(chart, pd.DataFrame) and not chart.empty:
+            column = "Adj Close" if "Adj Close" in chart.columns else "Close"
+            prices = pd.to_numeric(chart[column], errors="coerce").dropna()
+            returns = prices.pct_change().dropna().tolist()
+        payload = build_quantitative_research_payload(
+            artifact,
+            symbol,
+            returns=returns,
+            dataset_path=os.environ.get("FUNDAMENTAL_DATASET_PATH"),
+            security_master_path=os.environ.get("SECURITY_MASTER_PATH"),
+            price_dir=os.environ.get("ML_PRICE_CACHE_DIR"),
+        )
+        _cache_set(quantitative_research_cache, cache_key, payload, max_size=80)
+        return jsonify(payload)
+    except Exception as exc:
+        print("Errore ricerca quantitativa avanzata:", exc)
+        return jsonify({"status": "unavailable", "symbol": symbol, "error": "Ricerca quantitativa avanzata non disponibile."}), 500
+
+
 # -------------------------------
 # Endpoint tecnici stile TradingView
 # -------------------------------
 @app.route("/stock/<ticker>/technicals")
 def get_technicals(ticker):
-    raw_ticker = ticker
     timeframe = request.args.get("timeframe", "1d")
-    interval = TF_MAPPING.get(timeframe, "1d")
-    cache_symbol = (raw_ticker or "").strip().upper().replace(" ", "")
-    cache_key = f"{cache_symbol}:{timeframe}"
-    cached = _cache_get(technicals_cache, cache_key, TECHNICALS_CACHE_TTL)
-    if cached is not None:
-        return jsonify(cached)
-
+    if timeframe not in TF_MAPPING:
+        return jsonify({"error": "Timeframe non valido"}), 400
+    interval = TF_MAPPING[timeframe]
+    symbol = normalize_ticker(ticker)
     try:
-        if interval.endswith("m"):
-            period = "60d"
-            chart_range = "60d"
-        elif interval == "1d":
-            period = "2y"
-            chart_range = "5y"
-        elif interval == "1wk":
-            period = "5y"
-            chart_range = "10y"
+        if timeframe == "1d":
+            hist, symbol, meta = _load_page_daily_source(symbol)
+            source_id = hist.attrs.get("pageSourceId", "")
         else:
-            period = "20y"
-            chart_range = "20y"
-
-        hist = pd.DataFrame()
-        stock = None
-        for cand in ticker_candidates(raw_ticker):
-            stock = yf.Ticker(cand)
-            hist = _fetch_interval_history(cand, stock, period, interval, chart_range)
-            if not hist.empty:
-                ticker = cand
-                break
+            meta, hist = {}, pd.DataFrame()
+            period, chart_range = ("60d", "60d") if interval.endswith("m") else ("5y", "10y") if interval == "1wk" else ("20y", "20y")
+            source_id = f"{symbol}:{timeframe}"
+            cached = _cache_get(technicals_cache, f"{PAGE_ENGINE_VERSION}:{source_id}", TECHNICALS_CACHE_TTL)
+            if cached is not None:
+                return jsonify(cached)
+            for candidate in ticker_candidates(symbol):
+                hist = _fetch_interval_history(candidate, yf.Ticker(candidate), period, interval, chart_range)
+                if not hist.empty:
+                    symbol = candidate
+                    break
         if hist.empty:
             return jsonify({"error": "Nessun dato disponibile"}), 404
-
-        for col in ("Open", "High", "Low", "Close", "Volume"):
-            if col not in hist.columns:
-                hist[col] = np.nan
-        hist["Close"] = pd.to_numeric(hist["Close"], errors="coerce")
-        hist["Low"] = pd.to_numeric(hist["Low"], errors="coerce").fillna(hist["Close"])
-        hist["High"] = pd.to_numeric(hist["High"], errors="coerce").fillna(hist["Close"])
-        hist["Volume"] = pd.to_numeric(hist["Volume"], errors="coerce").fillna(0)
-        hist = hist.dropna(subset=["Close"])
-        if hist.empty:
-            return jsonify({"error": "Nessun dato disponibile"}), 404
-
-        close = hist["Close"].astype(float)
-        high = hist["High"].astype(float)
-        low = hist["Low"].astype(float)
-        volume = hist["Volume"].astype(float)
-
-        # ---------- Medie mobili ----------
-        ma_summary = []
-        ma_periods = [10, 20, 50, 100, 200]
-        ma_periods = [p for p in ma_periods if len(close) >= p]
-
-        # SMA ed EMA già presenti
-        for period in ma_periods:
-            sma = close.rolling(window=period).mean().bfill().iloc[-1]
-            action = "Buy" if close.iloc[-1] > sma else "Sell" if close.iloc[-1] < sma else "Neutral"
-            ma_summary.append({"name": f"SMA{period}", "value": round(sma,2), "action": action})
-
-            ema = close.ewm(span=period, adjust=False).mean().iloc[-1]
-            action = "Buy" if close.iloc[-1] > ema else "Sell" if close.iloc[-1] < ema else "Neutral"
-            ma_summary.append({"name": f"EMA{period}", "value": round(ema,2), "action": action})
-
-        # WMA, HMA, TEMA
-        for period in ma_periods:
-            # WMA
-            weights = np.arange(1, period+1)
-            wma = (close.rolling(period).apply(lambda prices: np.dot(prices, weights)/weights.sum(), raw=True)).iloc[-1]
-            action = "Buy" if close.iloc[-1] > wma else "Sell" if close.iloc[-1] < wma else "Neutral"
-            ma_summary.append({"name": f"WMA{period}", "value": round(wma,2), "action": action})
-
-            # HMA
-            half_len = int(period/2)
-            sqrt_len = int(np.sqrt(period))
-            wma_half = close.rolling(half_len).apply(lambda x: np.dot(x, np.arange(1,half_len+1))/np.sum(np.arange(1,half_len+1)), raw=True)
-            wma_full = close.rolling(period).apply(lambda x: np.dot(x, np.arange(1,period+1))/np.sum(np.arange(1,period+1)), raw=True)
-            hma = (2*wma_half - wma_full).rolling(sqrt_len).mean().iloc[-1]
-            action = "Buy" if close.iloc[-1] > hma else "Sell" if close.iloc[-1] < hma else "Neutral"
-            ma_summary.append({"name": f"HMA{period}", "value": round(hma,2), "action": action})
-
-            # TEMA
-            ema1 = close.ewm(span=period, adjust=False).mean()
-            ema2 = ema1.ewm(span=period, adjust=False).mean()
-            ema3 = ema2.ewm(span=period, adjust=False).mean()
-            tema = (3*ema1 - 3*ema2 + ema3).iloc[-1]
-            action = "Buy" if close.iloc[-1] > tema else "Sell" if close.iloc[-1] < tema else "Neutral"
-            ma_summary.append({"name": f"TEMA{period}", "value": round(tema,2), "action": action})
-
-        # ---------- Oscillatori ----------
-        oscillators = []
-
-        # RSI, MACD, Stochastic, ATR, CCI, ADX, Williams, ROC, Momentum già presenti
-        delta = close.diff()
-        up = delta.clip(lower=0)
-        down = -delta.clip(upper=0)
-        roll_up = up.rolling(14).mean()
-        roll_down = down.rolling(14).mean()
-        rsi14 = 100 - 100/(1 + roll_up/roll_down)
-        last_rsi = rsi14.iloc[-1]
-        rsi_action = "Sell" if last_rsi>70 else "Buy" if last_rsi<30 else "Neutral"
-        oscillators.append({"name":"RSI14","value":round(last_rsi,2),"action":rsi_action})
-
-        ema12 = close.ewm(span=12, adjust=False).mean()
-        ema26 = close.ewm(span=26, adjust=False).mean()
-        macd = ema12 - ema26
-        signal = macd.ewm(span=9, adjust=False).mean()
-        macd_action = "Buy" if macd.iloc[-1]>signal.iloc[-1] else "Sell" if macd.iloc[-1]<signal.iloc[-1] else "Neutral"
-        oscillators.append({"name":"MACD","value":round(macd.iloc[-1],2),"action":macd_action})
-
-        low14 = low.rolling(14).min()
-        high14 = high.rolling(14).max()
-        stochastic = 100*(close-low14)/(high14-low14)
-        stoch_action = "Sell" if stochastic.iloc[-1]>80 else "Buy" if stochastic.iloc[-1]<20 else "Neutral"
-        oscillators.append({"name":"Stochastic14","value":round(stochastic.iloc[-1],2),"action":stoch_action})
-
-        # ATR14
-        tr = pd.concat([high-low, abs(high-close.shift(1)), abs(low-close.shift(1))], axis=1).max(axis=1)
-        atr14 = tr.rolling(14).mean()
-        oscillators.append({"name":"ATR14","value":round(atr14.iloc[-1],2),"action":"Neutral"})
-
-        # CCI20
-        tp = (high+low+close)/3
-        sma_tp = tp.rolling(20).mean()
-        mean_dev = tp.rolling(20).apply(lambda x: np.mean(np.abs(x-np.mean(x))), raw=True)
-        cci = (tp - sma_tp)/(0.015*mean_dev)
-        cci_action = "Buy" if cci.iloc[-1]<-100 else "Sell" if cci.iloc[-1]>100 else "Neutral"
-        oscillators.append({"name":"CCI20","value":round(cci.iloc[-1],2),"action":cci_action})
-
-        # ADX14
-        plus_dm = high.diff()
-        minus_dm = -low.diff()
-        plus_dm[plus_dm<0]=0
-        minus_dm[minus_dm<0]=0
-        tr = pd.concat([high-low, abs(high-close.shift(1)), abs(low-close.shift(1))], axis=1).max(axis=1)
-        plus_di = 100*(plus_dm.rolling(14).sum()/tr.rolling(14).sum())
-        minus_di = 100*(minus_dm.rolling(14).sum()/tr.rolling(14).sum())
-        dx = (abs(plus_di-minus_di)/(plus_di+minus_di))*100
-        adx = dx.rolling(14).mean()
-        adx_action = "Tendenza Forte" if adx.iloc[-1]>25 else "Neutro"
-        oscillators.append({"name":"ADX14","value":round(adx.iloc[-1],2),"action":adx_action})
-
-        # Williams %R14
-        willr = -100*(high14-close)/(high14-low14)
-        willr_action = "Sell" if willr.iloc[-1]>-20 else "Buy" if willr.iloc[-1]<-80 else "Neutral"
-        oscillators.append({"name":"WilliamsR14","value":round(willr.iloc[-1],2),"action":willr_action})
-
-        # ROC12
-        roc12 = (close-close.shift(12))/close.shift(12)*100
-        roc12_action = "Buy" if roc12.iloc[-1]>0 else "Sell" if roc12.iloc[-1]<0 else "Neutral"
-        oscillators.append({"name":"ROC12","value":round(roc12.iloc[-1],2),"action":roc12_action})
-
-        # Momentum10
-        mom10 = close - close.shift(10)
-        mom10_action = "Buy" if mom10.iloc[-1]>0 else "Sell" if mom10.iloc[-1]<0 else "Neutral"
-        oscillators.append({"name":"Momentum10","value":round(mom10.iloc[-1],2),"action":mom10_action})
-
-        # Momentum3M
-        mom3M = close - close.shift(63)
-        last_mom3M = 0 if pd.isna(mom3M.iloc[-1]) else mom3M.iloc[-1]
-        mom3M_action = "Buy" if last_mom3M>0 else "Sell" if last_mom3M<0 else "Neutral"
-        oscillators.append({"name":"Momentum3M","value":round(last_mom3M,2),"action":mom3M_action})
-
-        # ------------------ 11 Oscillatori Aggiuntivi ------------------
-        # TRIX15
-        ema1 = close.ewm(span=15, adjust=False).mean()
-        ema2 = ema1.ewm(span=15, adjust=False).mean()
-        ema3 = ema2.ewm(span=15, adjust=False).mean()
-        trix = ema3.pct_change()*100
-        trix_action = "Buy" if trix.iloc[-1]>0 else "Sell" if trix.iloc[-1]<0 else "Neutral"
-        oscillators.append({"name":"TRIX15","value":round(trix.iloc[-1],2),"action":trix_action})
-
-        # Ultimate Oscillator
-        bp = close - low.rolling(1).min()
-        tr_uo = high.rolling(1).max() - low.rolling(1).min()
-        avg7 = bp.rolling(7).sum()/tr_uo.rolling(7).sum()
-        avg14 = bp.rolling(14).sum()/tr_uo.rolling(14).sum()
-        avg28 = bp.rolling(28).sum()/tr_uo.rolling(28).sum()
-        uo = 100*(4*avg7 + 2*avg14 + avg28)/7
-        uo_action = "Sell" if uo.iloc[-1]>70 else "Buy" if uo.iloc[-1]<30 else "Neutral"
-        oscillators.append({"name":"UltimateOsc","value":round(uo.iloc[-1],2),"action":uo_action})
-
-        # CCI50
-        tp50 = (high+low+close)/3
-        sma_tp50 = tp50.rolling(50).mean()
-        mean_dev50 = tp50.rolling(50).apply(lambda x: np.mean(np.abs(x-np.mean(x))), raw=True)
-        cci50 = (tp50 - sma_tp50)/(0.015*mean_dev50)
-        cci50_action = "Buy" if cci50.iloc[-1]<-100 else "Sell" if cci50.iloc[-1]>100 else "Neutral"
-        oscillators.append({"name":"CCI50","value":round(cci50.iloc[-1],2),"action":cci50_action})
-
-        # RSI7
-        up7 = delta.clip(lower=0)
-        down7 = -delta.clip(upper=0)
-        rsi7 = 100-100/(1+up7.rolling(7).mean()/down7.rolling(7).mean())
-        rsi7_action = "Sell" if rsi7.iloc[-1]>70 else "Buy" if rsi7.iloc[-1]<30 else "Neutral"
-        oscillators.append({"name":"RSI7","value":round(rsi7.iloc[-1],2),"action":rsi7_action})
-
-        # RSI21
-        up21 = delta.clip(lower=0)
-        down21 = -delta.clip(upper=0)
-        rsi21 = 100-100/(1+up21.rolling(21).mean()/down21.rolling(21).mean())
-        rsi21_action = "Sell" if rsi21.iloc[-1]>70 else "Buy" if rsi21.iloc[-1]<30 else "Neutral"
-        oscillators.append({"name":"RSI21","value":round(rsi21.iloc[-1],2),"action":rsi21_action})
-
-        # Stochastic Slow 14,3
-        k_slow = 100*(close-low.rolling(14).min())/(high.rolling(14).max()-low.rolling(14).min())
-        d_slow = k_slow.rolling(3).mean()
-        stoch_slow_action = "Sell" if k_slow.iloc[-1]>80 else "Buy" if k_slow.iloc[-1]<20 else "Neutral"
-        oscillators.append({"name":"StochSlow","value":round(k_slow.iloc[-1],2),"action":stoch_slow_action})
-
-        # Williams %R50
-        willr50 = -100*(high.rolling(50).max()-close)/(high.rolling(50).max()-low.rolling(50).min())
-        willr50_action = "Sell" if willr50.iloc[-1]>-20 else "Buy" if willr50.iloc[-1]<-80 else "Neutral"
-        oscillators.append({"name":"WilliamsR50","value":round(willr50.iloc[-1],2),"action":willr50_action})
-
-        # MACD Histogram
-        macd_hist = macd - signal
-        macd_hist_action = "Buy" if macd_hist.iloc[-1]>0 else "Sell" if macd_hist.iloc[-1]<0 else "Neutral"
-        oscillators.append({"name":"MACD_Hist","value":round(macd_hist.iloc[-1],2),"action":macd_hist_action})
-
-        # ROC6
-        roc6 = (close-close.shift(6))/close.shift(6)*100
-        roc6_action = "Buy" if roc6.iloc[-1]>0 else "Sell" if roc6.iloc[-1]<0 else "Neutral"
-        oscillators.append({"name":"ROC6","value":round(roc6.iloc[-1],2),"action":roc6_action})
-
-        # Momentum20
-        mom20 = close-close.shift(20)
-        mom20_action = "Buy" if mom20.iloc[-1]>0 else "Sell" if mom20.iloc[-1]<0 else "Neutral"
-        oscillators.append({"name":"Momentum20","value":round(mom20.iloc[-1],2),"action":mom20_action})
-
-        # CMF20
-        mf = ((close-low)-(high-close))/(high-low)*volume
-        cmf20 = mf.rolling(20).sum()/volume.rolling(20).sum()
-        cmf20_action = "Buy" if cmf20.iloc[-1]>0 else "Sell" if cmf20.iloc[-1]<0 else "Neutral"
-        oscillators.append({"name":"CMF20","value":round(cmf20.iloc[-1],2),"action":cmf20_action})
-
-        # ---------- Segnali generali ----------
-        ma_buy_count = sum(1 for x in ma_summary if x["action"]=="Buy")
-        ma_sell_count = sum(1 for x in ma_summary if x["action"]=="Sell")
-        osc_buy_count = sum(1 for x in oscillators if x["action"]=="Buy")
-        osc_sell_count = sum(1 for x in oscillators if x["action"]=="Sell")
-
-        ma_signal = "Neutral"
-        if ma_buy_count>ma_sell_count: ma_signal="Buy"
-        elif ma_sell_count>ma_buy_count: ma_signal="Sell"
-
-        osc_signal = "Neutral"
-        if osc_buy_count>osc_sell_count: osc_signal="Buy"
-        elif osc_sell_count>osc_buy_count: osc_signal="Sell"
-
-        general_signal = "Neutral"
-        if ma_signal=="Buy" and osc_signal=="Buy": general_signal="Buy"
-        elif ma_signal=="Sell" and osc_signal=="Sell": general_signal="Sell"
-
-        response = {
-            "overall": general_signal,
-            "movingAveragesSummary": ma_summary,
-            "oscillatorsSummary": oscillators,
-            "maSignal": ma_signal,
-            "oscSignal": osc_signal
-        }
+        cache_key = f"{PAGE_ENGINE_VERSION}:{source_id}"
+        cached = _cache_get(technicals_cache, cache_key, TECHNICALS_CACHE_TTL)
+        if cached is not None:
+            return jsonify(cached)
+        response = technical_page_payload(hist)
+        response.update(symbol=symbol, timeframe=timeframe, currency=meta.get("currency"),
+                        sourceId=source_id, completedDaily=timeframe == "1d")
+        response = _json_safe(response)
         _cache_set(technicals_cache, cache_key, response)
         return jsonify(response)
-
-    except Exception as e:
-        print("Errore tecnici:", e)
-        return jsonify({"error":"Errore nel recupero dati tecnici"}),500
-
+    except Exception as exc:
+        print("Errore tecnici:", type(exc).__name__)
+        return jsonify({"error": "Errore nel recupero dati tecnici"}), 500
 
 
-
-
-
-
-
-
-
-# -------------------------------
 # Endpoint notizie Yahoo Finance RSS
-# -------------------------------
 @app.route("/stock/<ticker>/news")
 def get_stock_news(ticker):
     try:
@@ -3001,256 +7035,28 @@ def compute_percentiles(curves_by_year):
 
 @app.route("/seasonality/<ticker>")
 def get_seasonality(ticker):
-    raw_ticker = ticker
-    cache_symbol = (raw_ticker or "").strip().upper().replace(" ", "")
     exclude_outliers = request.args.get("exclude_outliers", "false").lower() == "true"
-    cache_key = f"{cache_symbol}:outliers={exclude_outliers}"
-    cached = _cache_get(seasonality_cache, cache_key, SEASONALITY_CACHE_TTL)
-    if cached is not None:
-        return jsonify(cached)
+    prior_years_only = request.args.get("prior_years_only", "false").lower() == "true"
     try:
-        daily = pd.DataFrame()
-        period_candidates = ["20y", "10y", "5y", "2y", "1y"]
-        range_map = {"20y": "20y", "10y": "10y", "5y": "5y", "2y": "2y", "1y": "1y"}
-
-        for cand in ticker_candidates(raw_ticker):
-            stock = yf.Ticker(cand)
-            for period in period_candidates:
-                daily = _fetch_interval_history(
-                    cand, stock, period, "1d", range_map.get(period, "5y")
-                )
-                if not daily.empty:
-                    ticker = cand
-                    break
-            if not daily.empty:
-                break
-
+        daily, symbol, meta = _load_page_daily_source(ticker)
         if daily.empty or len(daily) < 120:
             return jsonify({"error": "Dati insufficienti"}), 404
-
-        monthly = _resample_ohlc(_normalize_ohlc_df(daily), "ME")
-        if monthly.empty or len(monthly) < 6:
-            return jsonify({"error": "Dati insufficienti"}), 404
-
-        df = _normalize_ohlc_df(monthly).copy().sort_index()
-        for col in ("Open", "Close"):
-            if col not in df.columns:
-                df[col] = np.nan
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.replace([np.inf, -np.inf], np.nan)
-        df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-        df = df.dropna(subset=["Open", "Close"])
-        df = df[df["Open"] > 0]
-        df["Month"] = df.index.month
-        df["Year"] = df.index.year
-        # TradingView-style stagionalità tabella: close mese vs close mese precedente.
-        df["MonthlyReturnPct"] = df["Close"].pct_change() * 100.0
-
-        current_year = datetime.now().year
-
-        seasonal_curve_by_year = {}
-        cumulative_curve_by_year = {}
-        if exclude_outliers:
-            valid = df["MonthlyReturnPct"].dropna()
-            if not valid.empty:
-                try:
-                    q05 = float(np.nanquantile(valid.values, 0.05))
-                    q95 = float(np.nanquantile(valid.values, 0.95))
-                    if q05 > q95:
-                        q05, q95 = q95, q05
-                    df["MonthlyReturnPct"] = df["MonthlyReturnPct"].clip(lower=q05, upper=q95)
-                except Exception:
-                    pass
-
-        # ================================
-        # CALCOLO STAGIONALITÀ (TradingView style)
-        # ================================
-        for year, group in df.groupby("Year"):
-            valid_months = int(group["MonthlyReturnPct"].notna().sum())
-            if year != current_year and valid_months < 6:
-                continue
-
-            monthly_curve = [None] * 12
-            cumulative_curve = [None] * 12
-            cum_return = 0.0
-
-            for _, row in group.iterrows():
-                month = int(row["Month"])
-                r = row["MonthlyReturnPct"]
-                if pd.isna(r) or not np.isfinite(r):
-                    continue
-                monthly_curve[month - 1] = round(float(r), 2)
-
-            for i in range(12):
-                v = monthly_curve[i]
-                if v is None:
-                    cumulative_curve[i] = None
-                    continue
-                cum_return = (1 + cum_return) * (1 + (v / 100.0)) - 1
-                cumulative_curve[i] = round(cum_return * 100, 2)
-
-            if any(v is not None for v in monthly_curve):
-                seasonal_curve_by_year[year] = monthly_curve
-                cumulative_curve_by_year[year] = cumulative_curve
-
-        if not seasonal_curve_by_year:
-            return jsonify({"error": "Dati stagionalità insufficienti"}), 404
-
-        # ================================
-        # PERCENTILI
-        # ================================
-        monthly_percentiles = compute_percentiles(seasonal_curve_by_year)
-        cumulative_percentiles = compute_percentiles(cumulative_curve_by_year)
-
-        response = {
-            "months": ["Gen", "Feb", "Mar", "Apr", "Mag", "Giu",
-                       "Lug", "Ago", "Set", "Ott", "Nov", "Dic"],
-            "seasonalCurveByYear": seasonal_curve_by_year,
-            "cumulativeCurveByYear": cumulative_curve_by_year,
-            "monthlyPercentiles": monthly_percentiles,
-            "cumulativePercentiles": cumulative_percentiles,
-            "years": sorted(seasonal_curve_by_year.keys()),
-            "excludeOutliers": exclude_outliers
-        }
-        _cache_set(seasonality_cache, cache_key, response, max_size=220)
+        key = f"{PAGE_ENGINE_VERSION}:{daily.attrs['pageSourceId']}:{exclude_outliers}:{prior_years_only}"
+        cached = _cache_get(seasonality_cache, key, SEASONALITY_CACHE_TTL)
+        if cached is not None:
+            return jsonify(cached)
+        response = seasonality_page_payload(daily, exclude_outliers, daily.index[-1], prior_years_only)
+        if not response["years"]:
+            return jsonify({"error": "Dati stagionalita insufficienti"}), 404
+        response.update(symbol=symbol, currency=meta.get("currency"), sourceId=daily.attrs["pageSourceId"])
+        response = _json_safe(response)
+        _cache_set(seasonality_cache, key, response, max_size=220)
         return jsonify(response)
-
-    except Exception as e:
-        print("Errore stagionalità:", e)
-        return jsonify({"error": "Errore stagionalità"}), 500
+    except Exception as exc:
+        print("Errore stagionalita:", type(exc).__name__)
+        return jsonify({"error": "Errore stagionalita"}), 500
     
 # ---------------------- Supply/Demand Functions ----------------------
-def calculate_supply_demand_zones(hist, bins=50, window=2, strength_percentile=75, pivot_source="close"):
-    hist = hist.copy().ffill()
-    price_min = hist['Low'].min()
-    price_max = hist['High'].max()
-    bin_edges = np.linspace(price_min, price_max, bins + 1)
-    
-    support_counts = np.zeros(bins)
-    resistance_counts = np.zeros(bins)
-    
-    # ADL cumulativo
-    price_range = hist['High'] - hist['Low']
-    price_range[price_range == 0] = 1e-9
-    adl = ((hist['Close'] - hist['Low']) - (hist['High'] - hist['Close'])) / price_range * hist['Volume']
-    adl = adl.cumsum()
-    
-    # Pivot con finestra mobile
-    for i in range(window, len(hist) - window):
-        if pivot_source == "hilo":
-            high_window = hist['High'].iloc[i - window:i + window + 1]
-            low_window = hist['Low'].iloc[i - window:i + window + 1]
-            price_today_high = hist['High'].iloc[i]
-            price_today_low = hist['Low'].iloc[i]
-            price_today = hist['Close'].iloc[i]
-        else:
-            price_window = hist['Close'].iloc[i - window:i + window + 1]
-            price_today = hist['Close'].iloc[i]
-
-        bin_idx = np.digitize(price_today, bin_edges) - 1
-        bin_idx = max(0, min(bin_idx, bins - 1))
-
-        if pivot_source == "hilo":
-            if price_today_low == low_window.min():
-                support_counts[bin_idx] += adl.iloc[i]
-            if price_today_high == high_window.max():
-                resistance_counts[bin_idx] += adl.iloc[i]
-        else:
-            if price_today == price_window.min():
-                support_counts[bin_idx] += adl.iloc[i]
-            elif price_today == price_window.max():
-                resistance_counts[bin_idx] += adl.iloc[i]
-    
-    support_threshold = np.percentile(support_counts, strength_percentile)
-    resistance_threshold = np.percentile(resistance_counts, strength_percentile)
-    
-    support_zones = []
-    resistance_zones = []
-    
-    for i in range(bins):
-        price_lower = bin_edges[i]
-        price_upper = bin_edges[i + 1]
-        price_mid = round(float((price_lower + price_upper) / 2), 2)
-        
-        if support_counts[i] >= support_threshold:
-            support_zones.append({
-                "price": price_mid,
-                "min": round(price_lower, 2),
-                "max": round(price_upper, 2),
-            })
-        if resistance_counts[i] >= resistance_threshold:
-            resistance_zones.append({
-                "price": price_mid,
-                "min": round(price_lower, 2),
-                "max": round(price_upper, 2),
-            })
-    
-    return {"support": support_zones, "resistance": resistance_zones}
-
-def determine_market_state(price, supports, resistances, proximity=1.5):
-    nearest_support = max([s["price"] for s in supports if s["price"] <= price], default=None)
-    nearest_resistance = min([r["price"] for r in resistances if r["price"] >= price], default=None)
-
-    if nearest_support is None or nearest_resistance is None:
-        return {"state": "IN_NONE", "strength": 0}
-
-    dist_support = ((price - nearest_support) / nearest_support) * 100
-    dist_resistance = ((nearest_resistance - price) / nearest_resistance) * 100
-
-    strength = round(100 - min(dist_support, dist_resistance), 2)
-
-    if dist_support < dist_resistance and dist_support < proximity:
-        return {"state": "IN_DEMAND", "strength": strength}
-    elif dist_resistance < dist_support and dist_resistance < proximity:
-        return {"state": "IN_SUPPLY", "strength": strength}
-    else:
-        return {"state": "IN_NONE", "strength": strength}
-
-def filter_zones_by_distance(zones, price, min_pct):
-    if price <= 0 or min_pct <= 0:
-        return zones
-
-    min_abs = price * (min_pct / 100.0)
-    supports = [s for s in zones["support"] if (price - s["price"]) >= min_abs]
-    resistances = [r for r in zones["resistance"] if (r["price"] - price) >= min_abs]
-
-    # Fallback: se filtriamo tutto, mantieni le zone originali
-    if not supports:
-        supports = zones["support"]
-    if not resistances:
-        resistances = zones["resistance"]
-
-    return {"support": supports, "resistance": resistances}
-
-def merge_close_zones(zones, min_gap_pct):
-    if min_gap_pct <= 0:
-        return zones
-
-    def merge_list(items):
-        if not items:
-            return items
-        items = sorted(items, key=lambda x: x["price"])
-        merged = [items[0]]
-        for item in items[1:]:
-            last = merged[-1]
-            gap = abs(item["price"] - last["price"])
-            min_gap = last["price"] * (min_gap_pct / 100.0)
-            if gap <= min_gap:
-                # Unisci media dei prezzi e aggiorna range
-                new_price = round((last["price"] + item["price"]) / 2, 2)
-                merged[-1] = {
-                    "price": new_price,
-                    "min": round(min(last["min"], item["min"]), 2),
-                    "max": round(max(last["max"], item["max"]), 2),
-                }
-            else:
-                merged.append(item)
-        return merged
-
-    return {
-        "support": merge_list(zones["support"]),
-        "resistance": merge_list(zones["resistance"]),
-    }
 
 # ---------------------- Flask Endpoint ----------------------
 @app.route("/stock/<ticker>/live_price")
@@ -3424,17 +7230,35 @@ def get_supply_demand(ticker):
 def get_stock_history(ticker):
     raw_ticker = ticker
     timeframe = request.args.get("timeframe", "1d")
+    requested_range = str(request.args.get("range") or "").strip().lower()
+    allowed_daily_ranges = {"1y": 1, "2y": 2, "3y": 3, "5y": 5, "10y": 10}
+    if requested_range not in allowed_daily_ranges:
+        requested_range = ""
     cache_symbol = (raw_ticker or "").strip().upper().replace(" ", "")
-    cache_key = f"{cache_symbol}:{timeframe}"
+    cache_key = f"v5:{cache_symbol}:{timeframe}:{requested_range or 'default'}"
     cached = _cache_get(history_cache, cache_key, HISTORY_CACHE_TTL)
-    if cached is not None:
+    if isinstance(cached, dict) and isinstance(cached.get("history"), list) and cached["history"]:
         return jsonify(cached)
     try:
         yf_interval = TF_MAPPING.get(timeframe, "1d")
+        generated_at = datetime.now(timezone.utc)
+        today_utc = pd.Timestamp(generated_at).tz_localize(None).normalize()
+        requested_cutoff = (
+            today_utc - pd.DateOffset(years=allowed_daily_ranges[requested_range])
+            if requested_range
+            else None
+        )
 
         if yf_interval == "1d":
-            period = "6mo"
-            chart_range = "1y"
+            buffered_ranges = {
+                "1y": "2y",
+                "2y": "5y",
+                "3y": "5y",
+                "5y": "10y",
+                "10y": "max",
+            }
+            period = buffered_ranges.get(requested_range, "6mo")
+            chart_range = buffered_ranges.get(requested_range, "1y")
         elif yf_interval == "1wk":
             period = "5y"
             chart_range = "5y"
@@ -3445,54 +7269,172 @@ def get_stock_history(ticker):
             period = "3mo"
             chart_range = "6mo"
 
-        date_fmt = "%Y-%m" if yf_interval == "1mo" else "%Y-%m-%d"
+        if yf_interval == "1mo":
+            date_fmt = "%Y-%m"
+        elif yf_interval.endswith("m"):
+            date_fmt = "%Y-%m-%d %H:%M"
+        else:
+            date_fmt = "%Y-%m-%d"
 
         tail_map = {"1d": 120, "1w": 120, "1mo": 120}
-        tail_limit = tail_map.get(timeframe, 120)
+        tail_limit = None if (yf_interval == "1d" and requested_range) else tail_map.get(timeframe, 120)
 
         hist = pd.DataFrame()
         stock = None
+        excluded_current_session = False
+        invalid_rows_removed = 0
         for cand in ticker_candidates(raw_ticker):
             stock = yf.Ticker(cand)
             hist = _fetch_interval_history(cand, stock, period, yf_interval, chart_range)
-            hist = hist.tail(tail_limit)
+            try:
+                candidate_invalid_rows_removed = max(
+                    int(hist.attrs.get("invalidRowsRemoved", 0)),
+                    0,
+                )
+            except (AttributeError, TypeError, ValueError):
+                candidate_invalid_rows_removed = 0
+            if yf_interval == "1d" and not requested_range and not hist.empty:
+                hist, _ = _fetch_latest_daily_market_data(cand, hist)
+            if (
+                yf_interval == "1d"
+                and requested_range
+                and not hist.empty
+                and isinstance(hist.index, pd.DatetimeIndex)
+            ):
+                # Una barra con data odierna puo essere ancora intraday. Senza
+                # una conferma esplicita di chiusura la escludiamo dal campione.
+                current_session_mask = hist.index.normalize() >= today_utc
+                excluded_current_session = bool(current_session_mask.any())
+                hist = hist.loc[~current_session_mask]
+            if (
+                yf_interval == "1d"
+                and requested_range
+                and not hist.empty
+                and isinstance(hist.index, pd.DatetimeIndex)
+            ):
+                eligible_positions = np.flatnonzero(hist.index >= requested_cutoff)
+                if eligible_positions.size:
+                    first_position = int(eligible_positions[0])
+                    # Conserva una chiusura precedente al cutoff: e il seed
+                    # necessario per il primo rendimento giornaliero del range.
+                    hist = hist.iloc[max(0, first_position - 1) :]
+                else:
+                    hist = hist.iloc[0:0]
+            if tail_limit is not None:
+                hist = hist.tail(tail_limit)
             if not hist.empty:
                 ticker = cand
+                invalid_rows_removed = candidate_invalid_rows_removed
                 break
         if hist.empty:
-            payload = {"history": []}
-            _cache_set(history_cache, cache_key, payload, max_size=320)
-            return jsonify(payload)
+            return jsonify({"history": [], "error": "Storico non disponibile"}), 404
 
-        for col in ("Open", "High", "Low", "Close"):
-            if col not in hist.columns:
-                hist[col] = np.nan
-        hist["Open"] = pd.to_numeric(hist["Open"], errors="coerce")
-        hist["High"] = pd.to_numeric(hist["High"], errors="coerce")
-        hist["Low"] = pd.to_numeric(hist["Low"], errors="coerce")
-        hist["Close"] = pd.to_numeric(hist["Close"], errors="coerce")
-        hist = hist.dropna(subset=["Open", "High", "Low", "Close"])
+        preparation_input_count = len(hist)
+        hist = _prepare_ohlc_df(hist, require_complete=True)
+        invalid_rows_removed = max(
+            int(hist.attrs.get("invalidRowsRemoved", 0) or 0),
+            invalid_rows_removed + max(preparation_input_count - len(hist), 0),
+        )
         if hist.empty:
-            payload = {"history": []}
-            _cache_set(history_cache, cache_key, payload, max_size=320)
-            return jsonify(payload)
+            return jsonify({"history": [], "error": "Storico non disponibile"}), 404
 
-        history_data = [
+        def finite_history_value(value, default=0.0):
+            numeric = _financial_number(value)
+            return float(numeric) if numeric is not None else float(default)
+
+        history_data = []
+        for date, row in hist.iterrows():
+            adjusted_close = (
+                _financial_number(row.get("Adj Close"))
+                if "Adj Close" in hist.columns
+                else None
+            )
+            history_data.append(
+                {
+                    "date": date.strftime(date_fmt),
+                    "open": round(float(row["Open"]), 2),
+                    "high": round(float(row["High"]), 2),
+                    "low": round(float(row["Low"]), 2),
+                    "close": round(float(row["Close"]), 2),
+                    "rawClose": round(float(row["Close"]), 6),
+                    "adjustedClose": (
+                        round(float(adjusted_close), 6)
+                        if adjusted_close is not None
+                        else None
+                    ),
+                    "volume": finite_history_value(row.get("Volume")),
+                    "dividend": finite_history_value(row.get("Dividends")),
+                    "stockSplit": finite_history_value(row.get("Stock Splits")),
+                }
+            )
+
+        includes_previous_close = bool(
+            requested_range
+            and history_data
+            and history_data[0]["date"] < requested_cutoff.date().isoformat()
+        )
+        observation_rows = (
+            history_data[1:] if includes_previous_close else history_data
+        )
+        observation_count = len(observation_rows)
+        adjusted_close_count = sum(
+            row.get("adjustedClose") is not None for row in observation_rows
+        )
+        corporate_action_count = sum(
+            int(row.get("dividend", 0.0) != 0.0)
+            + int(row.get("stockSplit", 0.0) != 0.0)
+            for row in observation_rows
+        )
+        payload = _json_safe(
             {
-                "date": date.strftime(date_fmt),
-                "open": round(float(row["Open"]), 2),
-                "high": round(float(row["High"]), 2),
-                "low": round(float(row["Low"]), 2),
-                "close": round(float(row["Close"]), 2),
+                "history": history_data,
+                "range": requested_range or "default",
+                "interval": timeframe,
+                "rangeStart": (
+                    requested_cutoff.date().isoformat()
+                    if requested_range and not hist.empty
+                    else None
+                ),
+                "rangeEnd": (
+                    today_utc.date().isoformat() if requested_range else None
+                ),
+                "includesPreviousClose": includes_previous_close,
+                "excludedPotentiallyIncompleteSession": excluded_current_session,
+                "priceField": (
+                    "adjustedClose"
+                    if any(row.get("adjustedClose") is not None for row in history_data)
+                    else "close"
+                ),
+                "requestedTicker": cache_symbol,
+                "resolvedTicker": str(ticker or cache_symbol).strip().upper(),
+                "generatedAt": (
+                    generated_at.replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                ),
+                "dataSource": "Yahoo Finance",
+                "observationCount": observation_count,
+                "actualStart": (
+                    observation_rows[0]["date"] if observation_rows else None
+                ),
+                "actualEnd": (
+                    observation_rows[-1]["date"] if observation_rows else None
+                ),
+                "adjustedCloseCount": adjusted_close_count,
+                "adjustedCloseCoveragePct": (
+                    round((adjusted_close_count / observation_count) * 100, 2)
+                    if observation_count
+                    else 0.0
+                ),
+                "corporateActionCount": corporate_action_count,
+                "invalidRowsRemoved": invalid_rows_removed,
             }
-            for date, row in hist.iterrows()
-        ]
-        payload = {"history": history_data}
+        )
         _cache_set(history_cache, cache_key, payload, max_size=320)
         return jsonify(payload)
     except Exception as e:
         print("Errore storico:", e)
-        return jsonify({"history": []}), 500
+        return jsonify({"history": [], "error": "Storico temporaneamente non disponibile"}), 503
 
 
 
@@ -3503,10 +7445,11 @@ def get_stock_history(ticker):
 if __name__ == "__main__":
     debug_env = os.environ.get("FLASK_DEBUG")
     debug_enabled = (
-        debug_env.lower() in {"1", "true", "yes", "on"} if debug_env is not None else True
+        debug_env.lower() in {"1", "true", "yes", "on"} if debug_env is not None else False
     )
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=debug_enabled)
-
-
-
-
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", "5000")),
+        debug=debug_enabled,
+        use_reloader=debug_enabled,
+    )

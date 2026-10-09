@@ -6,8 +6,11 @@ import Search from "./components/Search";
 import TechnicalsPage from "./components/TechnicalsPage";
 import Stagionalita from "./components/Stagionalità";
 import Previsione from "./components/Previsione";
+import FundamentalAnalysis from "./components/FundamentalAnalysis";
+import QuantitativeAnalysis from "./components/QuantitativeAnalysis";
 import AuthPage from "./components/AuthPage";
 import SocialPage from "./components/SocialPage";
+import MobileNavigation from "./components/MobileNavigation";
 
 import {
   changeAccountPassword,
@@ -21,6 +24,8 @@ import {
 
 import "bootstrap/dist/css/bootstrap.min.css";
 import "./App.css";
+import "./Mobile.css";
+import "./components/PrevisioneMobile.css";
 import "bootstrap/dist/js/bootstrap.bundle.min.js";
 
 const AUTH_TOKEN_KEY = "authToken";
@@ -137,6 +142,7 @@ function App() {
     if (!accountMenuOpen) return undefined;
 
     const handlePointerDown = (event) => {
+      if (event.target.closest?.(".mobile-navigation-account")) return;
       if (!accountMenuRef.current?.contains(event.target)) {
         setAccountMenuOpen(false);
       }
@@ -415,7 +421,7 @@ function App() {
 
   return (
     <Router>
-      <nav className={`app-navbar ${darkMode ? "dark" : "light"}`}>
+      <nav className={`app-navbar ${darkMode ? "dark" : "light"}${navOpen && accountMenuOpen ? " mobile-account-open" : ""}`}>
         <div className="nav-inner">
           <NavLink className="brand" to="/" onClick={closeNav}>
             Stock App
@@ -424,8 +430,9 @@ function App() {
           <button
             className={`nav-toggle ${navOpen ? "open" : ""}`}
             type="button"
-            aria-label="Apri menu"
+            aria-label={navOpen ? "Chiudi menu" : "Apri menu"}
             aria-expanded={navOpen}
+            aria-controls="app-navigation"
             onClick={toggleNav}
           >
             <span />
@@ -433,7 +440,7 @@ function App() {
             <span />
           </button>
 
-          <div className={`nav-content ${navOpen ? "open" : ""}`}>
+          <div id="app-navigation" className={`nav-content ${navOpen ? "open" : ""}`}>
             {isAuthenticated ? (
               <>
                 <div className="nav-links">
@@ -551,7 +558,7 @@ function App() {
         </div>
       </nav>
 
-      <div className={darkMode ? "bg-dark min-vh-100" : "bg-light min-vh-100"}>
+      <div className={`app-content ${isAuthenticated ? "app-content--mobile-nav" : ""} ${darkMode ? "bg-dark min-vh-100" : "bg-light min-vh-100"}`}>
         {authLoading ? (
           <div className="status loading">Verifica sessione in corso...</div>
         ) : (
@@ -588,6 +595,8 @@ function App() {
                 <Route path="/stagionalita" element={<Stagionalita darkMode={darkMode} />} />
                 <Route path="/Previsione" element={<Previsione darkMode={darkMode} />} />
                 <Route path="/previsione" element={<Previsione darkMode={darkMode} />} />
+                <Route path="/bilancio" element={<FundamentalAnalysis darkMode={darkMode} />} />
+                <Route path="/quantitativi" element={<QuantitativeAnalysis darkMode={darkMode} />} />
                 <Route
                   path="/social"
                   element={<SocialPage darkMode={darkMode} token={token} user={user} />}
@@ -603,6 +612,15 @@ function App() {
           </Routes>
         )}
       </div>
+
+      {isAuthenticated && <MobileNavigation darkMode={darkMode} onNavigate={closeNav}
+        username={user.username} accountOpen={navOpen && accountMenuOpen}
+        onAccountToggle={() => {
+          const nextOpen = !(navOpen && accountMenuOpen);
+          setNavOpen(nextOpen);
+          setAccountMenuOpen(nextOpen);
+          if (nextOpen) requestAnimationFrame(() => accountMenuRef.current?.querySelector('[role="menuitem"]')?.focus());
+        }} />}
 
       {accountDialog && (
         <div

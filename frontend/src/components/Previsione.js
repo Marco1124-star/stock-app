@@ -22,9 +22,10 @@ import {
 import { CandlestickController, CandlestickElement } from "chartjs-chart-financial";
 import "chartjs-adapter-date-fns";
 
-import { FiSearch, FiBarChart2, FiCalendar } from "react-icons/fi";
+import { FiSearch, FiBarChart2, FiCalendar, FiBookOpen } from "react-icons/fi";
 import { computeUnifiedTradingSignal } from "../utils/tradingSignal";
 import { apiUrl } from "../services/apiBase";
+import StructureNeuralCard from "./StructureNeuralCard";
 
 ChartJS.register(
   CategoryScale,
@@ -51,6 +52,7 @@ export default function SupplyDemandChart({ darkMode }) {
   );
 
   const [loading, setLoading] = useState(true);
+  const [loadedMainDataKey, setLoadedMainDataKey] = useState("");
   const [error, setError] = useState("");
   const [symbol, setSymbol] = useState(queryTicker?.toUpperCase() || "");
   const [history, setHistory] = useState([]);
@@ -77,6 +79,8 @@ export default function SupplyDemandChart({ darkMode }) {
   const [excludeOutliers, setExcludeOutliers] = useState(false);
   const [rawSeasonData, setRawSeasonData] = useState(null);
   const [gapHistory5Y, setGapHistory5Y] = useState([]);
+  const [gapHistorySymbol, setGapHistorySymbol] = useState("");
+  const [gapHistoryLoading, setGapHistoryLoading] = useState(true);
   const [gapXAxisTitle, setGapXAxisTitle] = useState("Periodo (ultimi 5 anni)");
   const [minYear, setMinYear] = useState(null);
   const [maxYear, setMaxYear] = useState(null);
@@ -88,6 +92,7 @@ export default function SupplyDemandChart({ darkMode }) {
   const [draftStrength, setDraftStrength] = useState("");
   const [draftMinDistance, setDraftMinDistance] = useState("");
   const [draftGap, setDraftGap] = useState("");
+  const neuralMainDataKey = `${symbol}|${timeframe}|${strengthPct}|${minDistancePct}|${gapPct}`;
 
   const rangeRef = useRef(null);
   const gapChartRef = useRef(null);
@@ -450,6 +455,7 @@ export default function SupplyDemandChart({ darkMode }) {
     if (!symbol) {
       setError("Nessun ticker specificato");
       setLoading(false);
+      setLoadedMainDataKey("");
       return;
     }
 
@@ -469,12 +475,14 @@ export default function SupplyDemandChart({ darkMode }) {
       setSdPrice(cached.data.sdPrice ?? 0);
       setPrice(cached.data.price ?? 0);
       setMarketState(cached.data.marketState || { state: "IN_NONE", strength: 0 });
+      setLoadedMainDataKey(cached.data.neuralReady ? cacheKey : "");
       setLoading(false);
       setError("");
       return;
     }
 
     setLoading(true);
+    setLoadedMainDataKey("");
     setError("");
 
     try {
@@ -499,6 +507,10 @@ export default function SupplyDemandChart({ darkMode }) {
 
       const historyData = historyRes?.data?.history;
       const sdData = sdRes?.data || null;
+      const neuralReady = Array.isArray(historyData) && historyData.length > 0 &&
+        ["support", "resistance"].every((kind) => Array.isArray(sdData?.zones?.[kind])) &&
+        Number.isFinite(Number(sdData?.current_price)) && Number(sdData?.current_price) > 0;
+      setLoadedMainDataKey(neuralReady ? cacheKey : "");
 
       setHistory(Array.isArray(historyData) ? historyData : []);
 
@@ -526,6 +538,7 @@ export default function SupplyDemandChart({ darkMode }) {
             sdPrice: sdData?.current_price ?? 0,
             price: sdData?.current_price ?? 0,
             marketState: sdData?.market_state || { state: "IN_NONE", strength: 0 },
+            neuralReady,
           },
         });
       }
@@ -855,15 +868,20 @@ export default function SupplyDemandChart({ darkMode }) {
   }, [symbol]);
 
   useEffect(() => {
+    setGapHistory5Y([]);
+    setGapHistorySymbol("");
     if (!symbol) {
-      setGapHistory5Y([]);
+      setGapHistoryLoading(false);
       return;
     }
+    setGapHistoryLoading(true);
 
     const cacheKey = `${symbol}|gap-5y`;
     const cached = gapHistoryCacheRef.current.get(cacheKey);
     if (cached && Date.now() - cached.ts < 10 * 60_000) {
       setGapHistory5Y(cached.data);
+      setGapHistorySymbol(symbol);
+      setGapHistoryLoading(false);
       return;
     }
 
@@ -889,10 +907,16 @@ export default function SupplyDemandChart({ darkMode }) {
         if (cancelled) return;
         gapHistoryCacheRef.current.set(cacheKey, { ts: Date.now(), data: filtered });
         setGapHistory5Y(filtered);
+        setGapHistorySymbol(symbol);
       } catch (e) {
         if (cancelled) return;
         console.error("Errore storico gap 5Y:", e);
         setGapHistory5Y([]);
+        // Preserve the page's fallback to the current main history, never the
+        // previous ticker's gap history, once this request has settled.
+        setGapHistorySymbol(symbol);
+      } finally {
+        if (!cancelled) setGapHistoryLoading(false);
       }
     };
 
@@ -942,6 +966,8 @@ export default function SupplyDemandChart({ darkMode }) {
               sdPrice: sdData?.current_price ?? 0,
               price: sdData?.current_price ?? 0,
               marketState: sdData?.market_state || { state: "IN_NONE", strength: 0 },
+              neuralReady: Array.isArray(historyData) && historyData.length > 0 &&
+                Array.isArray(sdData?.zones?.support) && Array.isArray(sdData?.zones?.resistance) && Number(sdData?.current_price) > 0,
             },
           });
         })
@@ -1049,8 +1075,8 @@ export default function SupplyDemandChart({ darkMode }) {
   }));
 
   const gapSourceHistory = useMemo(
-    () => (gapHistory5Y.length ? gapHistory5Y : history),
-    [gapHistory5Y, history]
+    () => (gapHistorySymbol === symbol && gapHistory5Y.length ? gapHistory5Y : history),
+    [gapHistory5Y, gapHistorySymbol, symbol, history]
   );
 
   const gapDisplayHistory = gapSourceHistory;
@@ -1807,6 +1833,44 @@ export default function SupplyDemandChart({ darkMode }) {
     darkMode,
   ]);
 
+  const cumulativeMiniChartImproved = useMemo(() => {
+    if (!seasonData || !Array.isArray(cumulativePercentilesMiniWinsorized) || cumulativePercentilesMiniWinsorized.length < 12) return null;
+    const nextMonthIndex = (currentMonthIndex + 1) % 12;
+    const monthLabels = rawSeasonData?.months || seasonData.months || [];
+    const labels = [monthLabels[currentMonthIndex] || "Corrente", monthLabels[nextMonthIndex] || "Successivo"];
+    const current = cumulativePercentilesMiniWinsorized[currentMonthIndex] || {};
+    const next = cumulativePercentilesMiniWinsorized[nextMonthIndex] || {};
+    const safe = (value) => (Number.isFinite(value) ? Number(value.toFixed(2)) : null);
+    const p10 = [safe(current.p10), safe(next.p10)];
+    const median = [safe(current.median), safe(next.median)];
+    const p90 = [safe(current.p90), safe(next.p90)];
+    const accent = darkMode ? "#2bd3b1" : "#168f77";
+    const muted = darkMode ? "#9aabc0" : "#667085";
+    const grid = darkMode ? "rgba(148,163,184,.16)" : "rgba(15,23,42,.09)";
+    return {
+      data: [
+        { x: labels, y: p90, type: "scatter", mode: "lines", name: "P90 · limite superiore", line: { color: "rgba(43,211,177,.35)", width: 1, dash: "dot" }, hovertemplate: "%{x}<br>P90: %{y:.2f}%<extra></extra>" },
+        { x: labels, y: p10, type: "scatter", mode: "lines", name: "P10 · limite inferiore", fill: "tonexty", fillcolor: darkMode ? "rgba(43,211,177,.13)" : "rgba(22,143,119,.10)", line: { color: "rgba(43,211,177,.35)", width: 1, dash: "dot" }, hovertemplate: "%{x}<br>P10: %{y:.2f}%<extra></extra>" },
+        { x: labels, y: median, type: "scatter", mode: "lines+markers+text", name: "Mediana cumulativa", text: median.map((value) => (value === null ? "" : `${value.toFixed(2)}%`)), textposition: "top center", textfont: { color: accent, size: 11 }, line: { color: accent, width: 3 }, marker: { color: [accent, darkMode ? "#f3c969" : "#b7791f"], size: 10, line: { color: darkMode ? "#10202f" : "#ffffff", width: 2 } }, hovertemplate: "%{x}<br>Mediana: %{y:.2f}%<extra></extra>" },
+      ],
+      layout: {
+        autosize: true,
+        paper_bgcolor: "transparent",
+        plot_bgcolor: "transparent",
+        font: { color: darkMode ? "#f3f6fb" : "#172033", family: "Inter, Segoe UI, sans-serif" },
+        legend: { orientation: "h", x: 0, xanchor: "left", y: 1.12, yanchor: "bottom", font: { size: 10, color: muted } },
+        xaxis: { automargin: true, fixedrange: true, tickfont: { size: 12, color: muted }, showgrid: false },
+        yaxis: { title: { text: "Rendimento cumulativo", font: { size: 11, color: muted } }, ticksuffix: "%", automargin: true, gridcolor: grid, zerolinecolor: grid, zerolinewidth: 1 },
+        hovermode: "x unified",
+        margin: { t: 62, l: 54, r: 18, b: 42 },
+      },
+      config: { responsive: true, displayModeBar: false, scrollZoom: false },
+    };
+  }, [seasonData, rawSeasonData, cumulativePercentilesMiniWinsorized, currentMonthIndex, darkMode]);
+  // Mantiene il grafico originale; l'implementazione migliorata resta disponibile senza alterare la resa richiesta.
+  void cumulativeMiniChartImproved;
+  const cumulativeMiniChartForRender = cumulativeMiniChart;
+
   const zonesBySelectedTimeframe = useMemo(() => {
     if (timeframe === "1w") return zones1WSignal;
     if (timeframe === "1mo") return zones1M;
@@ -2129,10 +2193,66 @@ export default function SupplyDemandChart({ darkMode }) {
     return <div className="status error status--previsione">{error}</div>;
   }
 return (
-    <div className={`supply-demand-page ${darkMode ? "dark" : "light"}`}>
+     <div className={`supply-demand-page ${darkMode ? "dark" : "light"}`}>
       <div className="supply-demand-main">
 
-        <div className="overview-strip-card">
+        <div className="info-cards info-cards--top previsione-nav-cards" aria-label="Sezioni del titolo">
+          <div className="info-card search-card" onClick={() => navigate(`/search?query=${encodeURIComponent(symbol)}`)} role="button" tabIndex={0}>
+            <div className="icon"><FiSearch /></div>
+            <div className="card-title">Cerca</div>
+          </div>
+          <div className="info-card search-card" onClick={() => navigate(`/technicals?ticker=${encodeURIComponent(symbol)}`)} role="button" tabIndex={0}>
+            <div className="icon"><FiBarChart2 /></div>
+            <div className="card-title">Tecnici</div>
+          </div>
+          <div className="info-card search-card" onClick={() => navigate(`/Stagionalita?ticker=${encodeURIComponent(symbol)}`)} role="button" tabIndex={0}>
+            <div className="icon"><FiCalendar /></div>
+            <div className="card-title">Stagionalita</div>
+          </div>
+          <div className="info-card search-card" onClick={() => navigate(`/bilancio?ticker=${encodeURIComponent(symbol)}`)} role="button" tabIndex={0}>
+            <div className="icon"><FiBookOpen /></div>
+            <div className="card-title">Bilancio</div>
+          </div>
+          <div className="info-card search-card" onClick={() => navigate(`/quantitativi?ticker=${encodeURIComponent(symbol)}`)} role="button" tabIndex={0}>
+            <div className="icon"><FiBarChart2 /></div>
+            <div className="card-title">Quantitativi</div>
+          </div>
+        </div>
+
+        <header className="previsione-mobile-hero">
+          <div className="previsione-mobile-hero-heading">
+            <div><span className="previsione-mobile-eyebrow">Analisi del titolo</span><h1>Previsioni</h1></div>
+            <span className="previsione-mobile-symbol">{symbol || "Titolo"}</span>
+          </div>
+          <div className="previsione-mobile-quote">
+            <span>Prezzo di riferimento</span>
+            <strong>{Number.isFinite(Number(price)) && Number(price) > 0 ? formatPrice(price) : "—"}</strong>
+          </div>
+          <nav className="previsione-mobile-sections" aria-label="Vai alla sezione di Previsioni">
+            <a href="#structure-neural-title">Modello</a>
+            <a href="#previsione-signals">Segnali</a>
+            <a href="#previsione-levels">Livelli</a>
+            <a href="#previsione-charts">Grafico</a>
+            <a href="#previsione-gaps">Gap</a>
+          </nav>
+        </header>
+
+        <StructureNeuralCard
+          ticker={symbol}
+          timeframe={timeframe}
+          onTimeframeChange={setTimeframe}
+          zones={zones}
+          gaps={gapAnalysis.openGaps}
+          candles={timeframe === "1d" || (gapHistorySymbol === symbol && gapHistory5Y.length) ? gapAnalysis.rows : []}
+          strengthPct={strengthPct}
+          minDistancePct={minDistancePct}
+          gapPct={gapPct}
+          loading={loading || Boolean(error) || loadedMainDataKey !== neuralMainDataKey ||
+            gapHistoryLoading || gapHistorySymbol !== symbol}
+        />
+
+        <div className="overview-strip-card" id="previsione-signals">
+          <p>Analisi a regole originale · score e forza non sono probabilità validate.</p>
           <div className="overview-strip-head">
             <div className="overview-strip-symbol">{symbol || "Ticker"}</div>
             <span className={`overview-signal-badge overview-signal-badge--hero ${tradingSignal.tone}`}>
@@ -2450,7 +2570,7 @@ return (
             </div>
           </div>
 
-          <div className="supply-demand-card">
+          <div className="supply-demand-card" id="previsione-levels">
             <div className="info-card-container">
               <div className="left-card">
                 <h2>Supply & Demand - {symbol}</h2>
@@ -2668,7 +2788,8 @@ return (
 
 {/* ================= CARD GRAFICO ================= */}
         <div className="chart-card">
-          <div className="supply-chart-panel">
+          <div className="supply-chart-panel" id="previsione-charts">
+            <h2 className="previsione-mobile-chart-title">Prezzo e livelli</h2>
             <div className="chart-controls">
               <div className="timeframe-selector">
                 {timeframes.map((tf) => (
@@ -2703,7 +2824,7 @@ return (
             <Chart type={effectiveChartType} data={chartData} options={chartOptions} />
           </div>
 
-          <div className="supply-chart-panel gap-chart-panel">
+          <div className="supply-chart-panel gap-chart-panel" id="previsione-gaps">
             <div className="gap-panel-header">
               <h3>Analisi Gap</h3>
               <span className="gap-panel-subtitle">
@@ -2814,12 +2935,12 @@ return (
                 <div className="tech-status">Caricamento…</div>
               ) : errorSeason ? (
                 <div className="tech-status">{errorSeason}</div>
-              ) : cumulativeMiniChart ? (
+              ) : cumulativeMiniChartForRender ? (
                 <div className="seasonality-mini-chart-wrap">
                   <Plot
-                    data={cumulativeMiniChart.data}
-                    layout={cumulativeMiniChart.layout}
-                    config={cumulativeMiniChart.config}
+                    data={cumulativeMiniChartForRender.data}
+                    layout={cumulativeMiniChartForRender.layout}
+                    config={cumulativeMiniChartForRender.config}
                     useResizeHandler
                     style={{ width: "100%", height: "100%" }}
                   />

@@ -2,23 +2,75 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import ChartWrapper from "./ChartWrapper";
+import FinanceSearch from "./FinanceSearch";
 import "./Search.css";
-import { FiTrendingUp, FiClock, FiCalendar } from "react-icons/fi";
+import {
+  FiBarChart2,
+  FiCalendar,
+  FiBookOpen,
+  FiClock,
+  FiTrendingUp,
+} from "react-icons/fi";
 import { apiUrl } from "../services/apiBase";
+import {
+  buildFallbackTickerData,
+  buildPerformanceHistoryFromOhlc,
+  getNonEmptyHistory,
+  mergeDailyQuoteIntoHistory,
+  reconcileTickerPrice,
+} from "../utils/searchFallback";
 
 const DEFAULT_TIMEFRAME = "1d";
 const TF_OPTIONS = ["1h", "4h", "1d", "1w"];
 const SEARCH_CACHE_TTL_MS = 120000;
 const HISTORY_CACHE_TTL_MS = 120000;
-const STORAGE_CACHE_PREFIX = "search-cache:";
+const STORAGE_CACHE_PREFIX = "search-cache:v4:";
 const timeframeLabel = tf => ({ "1h":"1H","4h":"4H","1d":"1D","1w":"1W" }[tf] || tf);
 
 const normalizeTicker = (value) =>
   (value || "").trim().toUpperCase().replace(/\s+/g, "");
 
-const fmtEuro = n => {
+const roundFinite = (value, digits = 2) => {
+  if (value == null || value === "") return null;
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue)
+    ? Number(numericValue.toFixed(digits))
+    : null;
+};
+
+const rememberLastTicker = (value) => {
+  try {
+    localStorage.setItem("lastTicker", value);
+  } catch {
+    // La disponibilita dei dati non deve dipendere dallo storage del browser.
+  }
+};
+
+const fmtCurrency = (n, currency) => {
   if (n == null) return "-";
-  return new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'EUR', minimumFractionDigits: 2 }).format(n);
+  const numericValue = Number(n);
+  if (!Number.isFinite(numericValue)) return "-";
+  const currencyCode = typeof currency === "string" ? currency.trim() : "";
+  const isIsoCurrency = /^[A-Z]{3}$/.test(currencyCode);
+
+  try {
+    if (isIsoCurrency) {
+      return new Intl.NumberFormat("it-IT", {
+        style: "currency",
+        currency: currencyCode,
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      }).format(numericValue);
+    }
+  } catch {
+    // Alcuni strumenti usano codici non ISO (ad esempio GBp).
+  }
+
+  const formatted = new Intl.NumberFormat("it-IT", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(numericValue);
+  return currencyCode ? `${formatted} ${currencyCode}` : formatted;
 };
 
 const fmtLarge = n => {
@@ -44,7 +96,6 @@ const percentInRange = (min, max, value) => {
 
 const isFiniteNumber = (v) => Number.isFinite(v);
 
-
 export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
   const location = useLocation();
   const navigate = useNavigate();
@@ -56,6 +107,7 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
   const historyAbortRef = useRef(null);
   const timeframeRef = useRef(DEFAULT_TIMEFRAME);
   const initialQuery = normalizeTicker(new URLSearchParams(location.search).get("query") || "");
+  const symbolRef = useRef(initialQuery.toUpperCase());
 
   const [searchInput, setSearchInput] = useState(initialQuery);
   const [ticker, setTicker] = useState(null);
@@ -64,12 +116,15 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [chartType, setChartType] = useState("line");
+  const [chartFullscreen, setChartFullscreen] = useState(false);
+  const [drawingTool, setDrawingTool] = useState("select");
   const [showRiskDetails, setShowRiskDetails] = useState(false);
 
   // Nuove variabili per rendimento personalizzato
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
   const [customPerformance, setCustomPerformance] = useState(null);
+  const [customPerformanceError, setCustomPerformanceError] = useState("");
 
   useEffect(() => {
     window.scrollTo({ top: 0, behavior: "instant" });
@@ -78,6 +133,17 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
   useEffect(() => {
     timeframeRef.current = timeframe;
   }, [timeframe]);
+
+  useEffect(() => {
+    symbolRef.current = normalizeTicker(symbol);
+  }, [symbol]);
+
+  useEffect(() => {
+    setStartDate("");
+    setEndDate("");
+    setCustomPerformance(null);
+    setCustomPerformanceError("");
+  }, [symbol]);
 
   useEffect(() => {
     return () => {
@@ -133,7 +199,7 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
     const cacheKey = `stock:${normalized}|${tf}`;
     const cached = readCache(cacheKey, SEARCH_CACHE_TTL_MS, true);
     if (cached?.data) {
-      setTicker(cached.data);
+      setTicker(reconcileTickerPrice(cached.data));
       setSymbol(normalized.toUpperCase());
       setError("");
       if (cached.fresh) return;
@@ -163,69 +229,141 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
       return msg;
     };
 
-    const tryFetch = async (tfToUse) => {
-      const res = await fetch(
-        apiUrl(`/stock/${encodeURIComponent(normalized)}?timeframe=${tfToUse}`),
-        { signal: controller.signal }
-      );
-      if (!res.ok) {
-        return { ok: false, res };
+    const fetchJsonWithRetry = async (url, attempts = 2) => {
+      let lastError = null;
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        try {
+          const res = await fetch(url, { signal: controller.signal });
+          if (!res.ok) {
+            if (res.status >= 500 && attempt < attempts - 1) {
+              await new Promise((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)));
+              continue;
+            }
+            return { ok: false, res };
+          }
+          const data = await res.json();
+          return { ok: true, res, data };
+        } catch (requestError) {
+          if (requestError?.name === "AbortError") throw requestError;
+          lastError = requestError;
+          if (attempt < attempts - 1) {
+            await new Promise((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)));
+          }
+        }
       }
-      const data = await res.json();
-      return { ok: true, data };
+      return { ok: false, res: null, error: lastError };
     };
+
+    const tryFetch = tfToUse => {
+      const url = apiUrl(
+        `/stock/${encodeURIComponent(normalized)}?timeframe=${tfToUse}`
+      );
+      return fetchJsonWithRetry(url);
+    };
+    const tryFetchHistory = tfToUse =>
+      fetchJsonWithRetry(
+        apiUrl(
+          `/stock/${encodeURIComponent(normalized)}/history?timeframe=${tfToUse}`
+        )
+      );
 
     try {
       let result = await tryFetch(tf);
+      let resolvedTimeframe = tf;
       if (!result.ok && tf !== "1d") {
         result = await tryFetch("1d");
-        if (result.ok) setTimeframe("1d");
+        if (result.ok) {
+          resolvedTimeframe = "1d";
+          setTimeframe("1d");
+        }
       }
       if (!result.ok) {
-        // fallback: prova priceOnly per mostrare almeno il prezzo
-        const priceRes = await fetch(
-          apiUrl(`/stock/${encodeURIComponent(normalized)}?priceOnly=true`),
-          { signal: controller.signal }
-        );
-        if (priceRes.ok) {
-          const priceData = await priceRes.json();
+        // Prezzo e storico hanno endpoint indipendenti: un errore nelle metriche
+        // avanzate non deve far sparire un grafico che è ancora disponibile.
+        let [priceResult, historyResult] = await Promise.all([
+          fetchJsonWithRetry(
+            apiUrl(`/stock/${encodeURIComponent(normalized)}?priceOnly=true`)
+          ),
+          tryFetchHistory(tf),
+        ]);
+        let recoveredHistory = historyResult.ok
+          ? getNonEmptyHistory(historyResult.data)
+          : [];
+
+        if (!recoveredHistory.length && tf !== "1d") {
+          historyResult = await tryFetchHistory("1d");
+          recoveredHistory = historyResult.ok
+            ? getNonEmptyHistory(historyResult.data)
+            : [];
+          if (recoveredHistory.length) {
+            resolvedTimeframe = "1d";
+            setTimeframe("1d");
+          }
+        }
+
+        const fallbackData = buildFallbackTickerData({
+          symbol: normalized,
+          cachedData: cached?.data,
+          priceData: priceResult.ok ? priceResult.data : null,
+          history: recoveredHistory,
+        });
+
+        if (
+          priceResult.ok
+          || fallbackData.ohlc.length
+          || cached?.data?.info
+        ) {
           if (requestId !== requestSeqRef.current) return;
-          setTicker({
-            info: priceData.info || {},
-            ohlc: [],
-            performance: {},
-            risk: { level: "N/D", index: null, metrics: {} },
-          });
-          setSymbol(normalized.toUpperCase());
-          localStorage.setItem("lastTicker", normalized.toUpperCase());
-          setError("Dati parziali disponibili. Storico non disponibile.");
+          setTicker(fallbackData);
+          setSymbol(normalized);
+          rememberLastTicker(normalized);
+          if (recoveredHistory.length) {
+            writeCache(`history:${normalized}|${resolvedTimeframe}`, {
+              history: recoveredHistory,
+            });
+          }
+          setError(
+            fallbackData.ohlc.length
+              ? ""
+              : "Storico temporaneamente non disponibile. Riprova tra poco."
+          );
           return;
         }
 
-        const msg = await parseError(result.res);
+        const errorResponse = result.res || priceResult.res || historyResult.res;
+        const msg = errorResponse
+          ? await parseError(errorResponse)
+          : "Connessione interrotta durante il caricamento. Riprova.";
         if (requestId !== requestSeqRef.current) return;
-        setError(msg);
+        setError(cached?.data?.info ? "" : msg);
         return;
       }
-      const data = result.data;
+      let data = result.data;
       if (requestId !== requestSeqRef.current) return;
 
+      if (!Array.isArray(data.performanceHistory) && Array.isArray(data.ohlc)) {
+        data.performanceHistory = buildPerformanceHistoryFromOhlc(data.ohlc);
+      }
+
       if (data.info) {
-        ["currentPrice", "marketCap", "dividend", "eps", "epsForward", "52WLow", "52WHigh", "dailyLow", "dailyHigh"].forEach(key => {
-          if (data.info[key] != null) data.info[key] = Number(data.info[key].toFixed(2));
+        ["currentPrice", "previousClose", "marketCap", "dividend", "eps", "epsForward", "52WLow", "52WHigh", "dailyOpen", "dailyLow", "dailyHigh", "dailyChange"].forEach(key => {
+          const roundedValue = roundFinite(data.info[key]);
+          if (roundedValue != null) data.info[key] = roundedValue;
         });
       }
 
+      data = reconcileTickerPrice(data);
       setTicker(data);
-      writeCache(cacheKey, data);
+      setError("");
+      writeCache(`stock:${normalized}|${resolvedTimeframe}`, data);
       setSymbol(normalized.toUpperCase());
-      localStorage.setItem("lastTicker", normalized.toUpperCase());
+      rememberLastTicker(normalized.toUpperCase());
 
     } catch(e) {
       if (e?.name === "AbortError") return;
       console.error(e);
       if (requestId !== requestSeqRef.current) return;
-      setError("Errore nella richiesta");
+      setError(cached?.data?.info ? "" : "Errore nella richiesta");
     } finally {
       if (requestId === requestSeqRef.current) {
         setLoading(false);
@@ -240,8 +378,12 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
 
     const cacheKey = `history:${normalized}|${tf}`;
     const cached = readCache(cacheKey, HISTORY_CACHE_TTL_MS, true);
-    if (cached?.data?.history) {
-      setTicker((prev) => (prev ? { ...prev, ohlc: cached.data.history } : prev));
+    const cachedHistory = getNonEmptyHistory(cached?.data);
+    if (cachedHistory.length) {
+      setTicker((prev) =>
+        prev ? reconcileTickerPrice({ ...prev, ohlc: cachedHistory }) : prev
+      );
+      setError("");
       if (cached.fresh) return;
     }
 
@@ -261,15 +403,22 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
       if (!res.ok) throw new Error(`Errore API (${res.status})`);
       const data = await res.json();
       if (requestId !== historySeqRef.current) return;
-      const history = Array.isArray(data?.history) ? data.history : [];
-      setTicker((prev) => (prev ? { ...prev, ohlc: history } : prev));
+      const history = getNonEmptyHistory(data);
+      if (!history.length) {
+        throw new Error("La risposta non contiene candele valide");
+      }
+      setTicker((prev) =>
+        prev ? reconcileTickerPrice({ ...prev, ohlc: history }) : prev
+      );
       writeCache(cacheKey, { history });
       setError("");
     } catch (e) {
       if (e?.name === "AbortError") return;
       console.error(e);
       if (requestId !== historySeqRef.current) return;
-      setError("Storico non disponibile per questo timeframe.");
+      if (!cachedHistory.length) {
+        setError("Storico temporaneamente non disponibile per questo timeframe.");
+      }
     } finally {
       if (requestId === historySeqRef.current) {
         setLoading(false);
@@ -278,41 +427,46 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
   }, [readCache, writeCache]);
 
   const fetchLivePrice = useCallback(async () => {
-    if (!symbol) return;
+    if (!symbol || loading) return;
+    const expectedSymbol = normalizeTicker(symbol);
     try {
       const res = await fetch(
-        apiUrl(`/stock/${encodeURIComponent(symbol)}?priceOnly=true`)
+        apiUrl(`/stock/${encodeURIComponent(expectedSymbol)}?priceOnly=true`)
       );
       if (!res.ok) return;
       const data = await res.json();
       if (data.info) {
         setTicker(prev => {
-          if (!prev) return prev;
-          const updatedTicker = {
-            ...prev,
-            info: {
-              ...prev.info,
-              currentPrice: Number(data.info.currentPrice.toFixed(2)),
-              dailyLow: Number(data.info.dailyLow.toFixed(2)),
-              dailyHigh: Number(data.info.dailyHigh.toFixed(2)),
-              dailyChange: Number(data.info.dailyChange.toFixed(2))
+          if (!prev || symbolRef.current !== expectedSymbol) return prev;
+          const previousInfo = prev.info || {};
+          const liveInfo = { ...previousInfo };
+
+          ["currentPrice", "previousClose", "dailyOpen", "dailyLow", "dailyHigh", "dailyChange"].forEach((key) => {
+            const roundedValue = roundFinite(data.info[key]);
+            if (roundedValue != null) liveInfo[key] = roundedValue;
+          });
+          ["currency", "priceDate", "priceTimestamp", "priceSource", "marketState"].forEach((key) => {
+            if (data.info[key] != null && data.info[key] !== "") {
+              liveInfo[key] = data.info[key];
             }
+          });
+
+          let updatedTicker = {
+            ...prev,
+            info: liveInfo,
           };
-          if (prev.ohlc && prev.ohlc.length) {
-            const lastCandle = prev.ohlc[prev.ohlc.length - 1];
-            const newCandle = {
-              ...lastCandle,
-              close: data.info.currentPrice,
-              high: Math.max(lastCandle.high, data.info.currentPrice),
-              low: Math.min(lastCandle.low, data.info.currentPrice)
-            };
-            updatedTicker.ohlc = [...prev.ohlc.slice(0, -1), newCandle];
+
+          if (timeframeRef.current === "1d") {
+            updatedTicker.ohlc = mergeDailyQuoteIntoHistory(
+              prev.ohlc,
+              liveInfo
+            );
           }
-          return updatedTicker;
+          return reconcileTickerPrice(updatedTicker);
         });
       }
     } catch(e){ console.error("Errore live price:", e); }
-  }, [symbol]);
+  }, [loading, symbol]);
 
 
 
@@ -324,13 +478,15 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
 
   useEffect(() => {
     if (!symbol) return;
+    fetchLivePrice();
     const interval = setInterval(() => fetchLivePrice(), 10000);
     return () => clearInterval(interval);
   }, [fetchLivePrice, symbol]);
 
-  const onSearch = () => {
-    const normalized = normalizeTicker(searchInput);
+  const onSearch = (value = searchInput) => {
+    const normalized = normalizeTicker(value);
     if (!normalized) return;
+    setSearchInput(normalized);
     if (normalized === initialQuery) {
       fetchTicker(normalized.trim(), timeframe);
       return;
@@ -370,27 +526,42 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
   };
   // --- Nuova funzione per calcolare rendimento + CAGR ---
   const calculateCustomPerformance = () => {
-    if (!ticker?.ohlc || !startDate || !endDate) return;
-
-    const start = new Date(startDate);
-    const end = new Date(endDate);
-
-    const filtered = ticker.ohlc.filter(candle => {
-      const d = new Date(candle.date);
-      return d >= start && d <= end;
-    });
-
-    if (filtered.length < 2) {
-      setCustomPerformance(null);
+    setCustomPerformance(null);
+    setCustomPerformanceError("");
+    if (!startDate || !endDate) {
+      setCustomPerformanceError("Seleziona entrambe le date.");
+      return;
+    }
+    if (startDate > endDate) {
+      setCustomPerformanceError("La data iniziale deve precedere quella finale.");
       return;
     }
 
-    const initialPrice = filtered[0].close;
-    const finalPrice = filtered[filtered.length - 1].close;
+    const history = Array.isArray(ticker?.performanceHistory)
+      ? ticker.performanceHistory
+      : [];
+    const filtered = history.filter(
+      point => point.date >= startDate && point.date <= endDate && Number(point.close) > 0
+    );
+
+    if (filtered.length < 2) {
+      setCustomPerformanceError("Servono almeno due sedute disponibili nell'intervallo.");
+      return;
+    }
+
+    const firstPoint = filtered[0];
+    const lastPoint = filtered[filtered.length - 1];
+    const initialPrice = Number(firstPoint.close);
+    const finalPrice = Number(lastPoint.close);
 
     const rendimento = ((finalPrice - initialPrice) / initialPrice) * 100;
-
-    const days = (end - start) / (1000 * 60 * 60 * 24);
+    const startTimestamp = Date.parse(`${firstPoint.date}T00:00:00Z`);
+    const endTimestamp = Date.parse(`${lastPoint.date}T00:00:00Z`);
+    const days = (endTimestamp - startTimestamp) / (1000 * 60 * 60 * 24);
+    if (!Number.isFinite(days) || days <= 0) {
+      setCustomPerformanceError("Intervallo non valido per il calcolo.");
+      return;
+    }
     const years = days / 365.25;
     const cagr = Math.pow(finalPrice / initialPrice, 1 / years) - 1;
 
@@ -398,24 +569,28 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
       initialPrice,
       finalPrice,
       rendimento,
-      cagr: cagr * 100
+      cagr: cagr * 100,
+      actualStartDate: firstPoint.date,
+      actualEndDate: lastPoint.date,
     });
   };
 
   const riskInfo = ticker?.risk || { level: "N/D", index: null, metrics: {} };
+  const riskMetrics = riskInfo.metrics || {};
   const riskIndexLabel = riskInfo.index != null ? `${riskInfo.index}/100` : "N/D";
   const riskClass = riskInfo.level === "N/D" ? "nd" : riskInfo.level.toLowerCase();
-  const liquidityLabel = riskInfo.metrics?.avgDollarVolume != null
-    ? `${fmtLarge(riskInfo.metrics.avgDollarVolume)} EUR`
-    : (riskInfo.metrics?.avgVolume != null ? `${fmtLarge(riskInfo.metrics.avgVolume)} vol` : "N/D");
-  const marketCapLabel = riskInfo.metrics?.marketCap != null ? fmtLarge(riskInfo.metrics.marketCap) : "N/D";
-  const volRegimeLabel = riskInfo.metrics?.volRegime != null ? `${riskInfo.metrics.volRegime.toFixed(2)}x` : "N/D";
   const info = ticker?.info || {};
+  const currency = typeof info.currency === "string" ? info.currency.trim() : "";
+  const currencySuffix = currency ? ` ${currency}` : "";
+  const averageTradedValue = riskMetrics.avgTradedValue ?? riskMetrics.avgDollarVolume;
+  const liquidityLabel = averageTradedValue != null
+    ? `${fmtLarge(averageTradedValue)}${currencySuffix}`
+    : (riskMetrics.avgVolume != null ? `${fmtLarge(riskMetrics.avgVolume)} vol` : "N/D");
+  const marketCapLabel = riskMetrics.marketCap != null
+    ? `${fmtLarge(riskMetrics.marketCap)}${currencySuffix}`
+    : "N/D";
+  const volRegimeLabel = riskMetrics.volRegime != null ? `${riskMetrics.volRegime.toFixed(2)}x` : "N/D";
   const currentPrice = Number.isFinite(info.currentPrice) ? info.currentPrice : null;
-  const epsFromPe =
-    currentPrice != null && Number.isFinite(info.peRatio) && info.peRatio !== 0
-      ? currentPrice / info.peRatio
-      : null;
   const dividendFromYield =
     currentPrice != null && Number.isFinite(info.dividendYield)
       ? info.dividendYield * currentPrice
@@ -424,36 +599,37 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
     currentPrice != null && Number.isFinite(info.dividend) && currentPrice > 0
       ? info.dividend / currentPrice
       : null;
-  const peFromEps =
-    currentPrice != null && Number.isFinite(info.eps) && info.eps !== 0
-      ? currentPrice / info.eps
-      : null;
+  const performanceHistory = Array.isArray(ticker?.performanceHistory)
+    ? ticker.performanceHistory
+    : [];
+  const firstAvailableDate = performanceHistory[0]?.date || undefined;
+  const lastAvailableDate = performanceHistory[performanceHistory.length - 1]?.date || undefined;
 
   const overview = {
-    marketCap: info.marketCap ?? riskInfo.metrics?.marketCap ?? null,
-    peRatio: info.peRatio ?? peFromEps ?? info.forwardPE ?? null,
-    eps: info.eps ?? epsFromPe ?? null,
+    marketCap: info.marketCap ?? riskMetrics.marketCap ?? null,
+    peRatio: info.peRatio ?? null,
+    eps: info.eps ?? null,
     dividend: info.dividend ?? dividendFromYield ?? null,
-    beta: info.beta ?? riskInfo.metrics?.beta ?? null,
+    beta: info.beta ?? riskMetrics.beta ?? null,
     low52w: info["52WLow"] ?? null,
     high52w: info["52WHigh"] ?? null,
     volume: info.volume ?? null,
-    averageVolume: info.averageVolume ?? riskInfo.metrics?.avgVolume ?? null,
-    forwardPE: info.forwardPE ?? info.peRatio ?? peFromEps ?? null,
+    averageVolume: info.averageVolume ?? riskMetrics.avgVolume ?? null,
+    forwardPE: info.forwardPE ?? null,
     dividendYield: info.dividendYield ?? dividendYieldFromDividend ?? null,
-    epsForward: info.epsForward ?? info.eps ?? epsFromPe ?? null,
+    epsForward: info.epsForward ?? null,
     priceToSales: info.priceToSalesTrailing12Months ?? null,
     priceToBook: info.priceToBook ?? null,
   };
 
   const overviewMetrics = [
-    { key: "marketCap", label: "Market Cap", raw: overview.marketCap, text: fmtLarge(overview.marketCap) },
+    { key: "marketCap", label: "Market Cap", raw: overview.marketCap, text: `${fmtLarge(overview.marketCap)}${currencySuffix}` },
     { key: "peRatio", label: "P/E Ratio", raw: overview.peRatio, text: isFiniteNumber(overview.peRatio) ? Number(overview.peRatio).toFixed(2) : null },
     { key: "forwardPE", label: "Forward P/E", raw: overview.forwardPE, text: isFiniteNumber(overview.forwardPE) ? Number(overview.forwardPE).toFixed(2) : null },
-    { key: "eps", label: "EPS", raw: overview.eps, text: fmtEuro(overview.eps) },
-    { key: "epsForward", label: "EPS Next 5Y", raw: overview.epsForward, text: fmtEuro(overview.epsForward) },
+    { key: "eps", label: "EPS (TTM)", raw: overview.eps, text: fmtCurrency(overview.eps, currency) },
+    { key: "epsForward", label: "EPS Forward", raw: overview.epsForward, text: fmtCurrency(overview.epsForward, currency) },
     { key: "beta", label: "Beta", raw: overview.beta, text: isFiniteNumber(overview.beta) ? Number(overview.beta).toFixed(2) : null },
-    { key: "dividend", label: "Dividendo", raw: overview.dividend, text: fmtEuro(overview.dividend) },
+    { key: "dividend", label: "Dividendo", raw: overview.dividend, text: fmtCurrency(overview.dividend, currency) },
     {
       key: "dividendYield",
       label: "Dividend Yield",
@@ -462,8 +638,8 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
     },
     { key: "priceToSales", label: "Price/Sales", raw: overview.priceToSales, text: isFiniteNumber(overview.priceToSales) ? Number(overview.priceToSales).toFixed(2) : null },
     { key: "priceToBook", label: "Price/Book", raw: overview.priceToBook, text: isFiniteNumber(overview.priceToBook) ? Number(overview.priceToBook).toFixed(2) : null },
-    { key: "low52w", label: "52W Low", raw: overview.low52w, text: fmtEuro(overview.low52w) },
-    { key: "high52w", label: "52W High", raw: overview.high52w, text: fmtEuro(overview.high52w) },
+    { key: "low52w", label: "52W Low", raw: overview.low52w, text: fmtCurrency(overview.low52w, currency) },
+    { key: "high52w", label: "52W High", raw: overview.high52w, text: fmtCurrency(overview.high52w, currency) },
     { key: "volume", label: "Volume", raw: overview.volume, text: fmtLarge(overview.volume) },
     { key: "averageVolume", label: "Volume medio giornaliero", raw: overview.averageVolume, text: fmtLarge(overview.averageVolume) },
   ];
@@ -501,17 +677,8 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
 
   return (
     <div className={`search-page ${darkMode ? "dark" : "light"}`}>
-      <div className="search-top">
-        <h1 className="title">Cerca un titolo</h1>
-        <div className="search-controls">
-          <input
-            placeholder={loading ? "Sto cercando..." : "Inserisci ticker (es: AAPL)"}
-            value={searchInput}
-            onChange={e => setSearchInput(e.target.value)}
-            onKeyDown={e => e.key==="Enter" && onSearch()}
-          />
-          <button className="btn-primary" onClick={onSearch}>Cerca</button>
-        </div>
+      <div className="search-top search-hero search-hero--compact">
+        <FinanceSearch value={searchInput} onChange={setSearchInput} onSelect={onSearch} />
       </div>
 
       {ticker?.info && (
@@ -525,7 +692,6 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
         >
           <div className="icon"><FiTrendingUp /></div>
           <div className="card-title">Tecnici</div>
-          <div className="card-desc">Analisi tecnica basata su indicatori e trend.</div>
         </div>
 
         <div
@@ -537,7 +703,6 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
         >
           <div className="icon"><FiClock /></div>
           <div className="card-title">Previsioni</div>
-          <div className="card-desc">Stime di rendimento future basate su modelli statistici.</div>
         </div>
 
         <div
@@ -549,7 +714,28 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
         >
           <div className="icon"><FiCalendar /></div>
           <div className="card-title">Stagionalita</div>
-          <div className="card-desc">Trend storici e stagionali per il titolo selezionato.</div>
+        </div>
+
+        <div
+          className="info-card search-card"
+          onClick={() =>
+            navigate(`/bilancio?ticker=${encodeURIComponent(symbol || searchInput)}`)
+          }
+          style={{ cursor: "pointer" }}
+        >
+          <div className="icon"><FiBookOpen /></div>
+          <div className="card-title">Bilancio</div>
+        </div>
+
+        <div
+          className="info-card search-card"
+          onClick={() =>
+            navigate(`/quantitativi?ticker=${encodeURIComponent(symbol || searchInput)}`)
+          }
+          style={{ cursor: "pointer" }}
+        >
+          <div className="icon"><FiBarChart2 /></div>
+          <div className="card-title">Quantitativi</div>
         </div>
       </div>
       )}
@@ -578,14 +764,14 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
                 <div className="sector">{ticker.info.sector || "-"}</div>
               </div>
               <div className="price-block">
-                <div className="price">{fmtEuro(ticker.info.currentPrice)}</div>
+                <div className="price">{fmtCurrency(ticker.info.currentPrice, currency)}</div>
                 <div className={`change ${(ticker.info.dailyChange ?? 0)>=0?"up":"down"}`}>
                   {ticker.info.dailyChange ?? "-"}%
                 </div>
               </div>
             </div>
 
-            <div className="tf-chart-group">
+            <div className={`tf-chart-group${chartFullscreen ? " tf-chart-group--fullscreen" : ""}`}>
               {TF_OPTIONS.map(tf => (
                 <button key={tf} className={`tf-btn ${tf===timeframe?"active":""}`} onClick={()=>onTfClick(tf)}>
                   {timeframeLabel(tf)}
@@ -594,11 +780,27 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
               <button className={`tf-btn ${chartType==="line"?"active":""}`} onClick={()=>onChartType("line")}>Linee</button>
               <button className={`tf-btn ${chartType==="candlestick"?"active":""}`} onClick={()=>onChartType("candlestick")}>Candele</button>
               <button className="tf-btn" onClick={resetZoom}>Reset Zoom</button>
+              <button className={`tf-btn ${chartFullscreen ? "active" : ""}`} onClick={() => setChartFullscreen((value) => !value)}>
+                {chartFullscreen ? "Chiudi schermo intero" : "Schermo intero"}
+              </button>
+              {chartFullscreen && (
+                <>
+                  <button className={`tf-btn ${drawingTool === "pen" ? "active" : ""}`} onClick={() => setDrawingTool("pen")}>Disegno libero</button>
+                  <button className={`tf-btn ${drawingTool === "line" ? "active" : ""}`} onClick={() => setDrawingTool("line")}>Linea</button>
+                  <button className={`tf-btn ${drawingTool === "ray" ? "active" : ""}`} onClick={() => setDrawingTool("ray")}>Ray</button>
+                  <button className={`tf-btn ${drawingTool === "horizontal" ? "active" : ""}`} onClick={() => setDrawingTool("horizontal")}>Orizzontale</button>
+                  <button className={`tf-btn ${drawingTool === "vertical" ? "active" : ""}`} onClick={() => setDrawingTool("vertical")}>Verticale</button>
+                  <button className={`tf-btn ${drawingTool === "rectangle" ? "active" : ""}`} onClick={() => setDrawingTool("rectangle")}>Rettangolo</button>
+                  <button className={`tf-btn ${drawingTool === "fibonacci" ? "active" : ""}`} onClick={() => setDrawingTool("fibonacci")}>Fibonacci</button>
+                  <button className={`tf-btn ${drawingTool === "eraser" ? "active" : ""}`} onClick={() => setDrawingTool("eraser")}>Cancella ultimo</button>
+                  <button className={`tf-btn ${drawingTool === "select" ? "active" : ""}`} onClick={() => setDrawingTool("select")}>Seleziona</button>
+                </>
+              )}
             </div>
 
-            {ticker?.ohlc && (
+            {Array.isArray(ticker?.ohlc) && ticker.ohlc.length > 0 && (
               <>
-                <ChartWrapper ref={chartRef} data={ticker.ohlc} darkMode={darkMode} chartType={chartType} />
+                <ChartWrapper ref={chartRef} data={ticker.ohlc} darkMode={darkMode} chartType={chartType} fullscreen={chartFullscreen} drawingTool={drawingTool} />
 
                 <div className="performance-trend">
                   <h4 className="performance-title">
@@ -613,11 +815,12 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
                   <div className="kv"><span>Volatilita storica</span><b>{ticker.performance?.volatility ?? "-"}%</b></div>
                   <div className="kv"><span>Momentum (1M)</span><b>{ticker.performance?.momentum1M ?? "-"}%</b></div>
                   <div className="kv"><span>Momentum (3M)</span><b>{ticker.performance?.momentum3M ?? "-"}%</b></div>
-                  <div className="kv"><span>Volatilita 30 giorni</span><b>{ticker.performance?.volatility30D ?? "-"}%</b></div>
+                  <div className="kv"><span>Volatilita 30 sedute</span><b>{ticker.performance?.volatility30D ?? "-"}%</b></div>
                   <div className="kv"><span>Volatilita 1 anno</span><b>{ticker.performance?.volatility1Y ?? "-"}%</b></div>
                   <div className="kv"><span>Max Drawdown 1 anno</span><b>{ticker.performance?.maxDrawdown1Y ?? "-"}%</b></div>
-                  <div className="kv"><span>Sharpe Ratio</span><b>{ticker.performance?.sharpeRatio ?? "-"}</b></div>
-                  <div className="kv"><span>Sortino Ratio</span><b>{ticker.performance?.sortinoRatio ?? "-"}</b></div>
+                  <div className="kv"><span>Sharpe Ratio (1Y)</span><b>{ticker.performance?.sharpeRatio ?? "-"}</b></div>
+                  <div className="kv"><span>Sortino Ratio (1Y)</span><b>{ticker.performance?.sortinoRatio ?? "-"}</b></div>
+                  <div className="kv"><span>Tasso privo di rischio</span><b>{ticker.performance?.riskFreeRate ?? 0}%</b></div>
                 </div>
               </>
             )}
@@ -652,33 +855,36 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
                   <span>Indice rischio</span>
                   <strong>{riskIndexLabel}</strong>
                 </div>
-                <div className="risk-subtitle">Indice composito basato su volatilita, drawdown, beta e rendimento/rischio.</div>
+                <div className="risk-subtitle">
+                  Stima proprietaria basata su volatilita, drawdown, beta e rendimento corretto per il rischio
+                  {riskInfo.coverage != null ? ` (copertura ${riskInfo.coverage}%).` : "."}
+                </div>
                 <div className="risk-kpis">
                   <div className="risk-kpi">
                     <span>Vol 1Y</span>
-                    <strong>{riskInfo.metrics.vol1y != null ? `${riskInfo.metrics.vol1y.toFixed(1)}%` : "N/D"}</strong>
+                    <strong>{riskMetrics.vol1y != null ? `${riskMetrics.vol1y.toFixed(1)}%` : "N/D"}</strong>
                   </div>
                   <div className="risk-kpi">
                     <span>Drawdown 1Y</span>
-                    <strong>{riskInfo.metrics.drawdown != null ? `${riskInfo.metrics.drawdown.toFixed(1)}%` : "N/D"}</strong>
+                    <strong>{riskMetrics.drawdown != null ? `${riskMetrics.drawdown.toFixed(1)}%` : "N/D"}</strong>
                   </div>
                   <div className="risk-kpi">
                     <span>Beta</span>
-                    <strong>{riskInfo.metrics.beta != null ? riskInfo.metrics.beta.toFixed(2) : "N/D"}</strong>
+                    <strong>{riskMetrics.beta != null ? riskMetrics.beta.toFixed(2) : "N/D"}</strong>
                   </div>
                   <div className="risk-kpi">
                     <span>Sharpe</span>
-                    <strong>{riskInfo.metrics.sharpe != null ? riskInfo.metrics.sharpe.toFixed(2) : "N/D"}</strong>
+                    <strong>{riskMetrics.sharpe != null ? riskMetrics.sharpe.toFixed(2) : "N/D"}</strong>
                   </div>
                   {showRiskDetails && (
                     <>
                       <div className="risk-kpi">
-                        <span>Vol 30g</span>
-                        <strong>{riskInfo.metrics.vol30 != null ? `${riskInfo.metrics.vol30.toFixed(1)}%` : "N/D"}</strong>
+                        <span>Vol 30 sedute</span>
+                        <strong>{riskMetrics.vol30 != null ? `${riskMetrics.vol30.toFixed(1)}%` : "N/D"}</strong>
                       </div>
                       <div className="risk-kpi">
                         <span>Sortino</span>
-                        <strong>{riskInfo.metrics.sortino != null ? riskInfo.metrics.sortino.toFixed(2) : "N/D"}</strong>
+                        <strong>{riskMetrics.sortino != null ? riskMetrics.sortino.toFixed(2) : "N/D"}</strong>
                       </div>
                       <div className="risk-kpi">
                         <span>Liquidita</span>
@@ -692,6 +898,16 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
                         <span>Regime Vol</span>
                         <strong>{volRegimeLabel}</strong>
                       </div>
+                      <div className="risk-kpi">
+                        <span>Risk-free</span>
+                        <strong>{riskMetrics.riskFreeRate != null ? `${riskMetrics.riskFreeRate}%` : "N/D"}</strong>
+                      </div>
+                      {riskMetrics.benchmarkSymbol && (
+                        <div className="risk-kpi">
+                          <span>Benchmark beta</span>
+                          <strong>{riskMetrics.benchmarkSymbol}</strong>
+                        </div>
+                      )}
                     </>
                   )}
                 </div>
@@ -715,15 +931,45 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
                     <span className="title-text">Rendimento personalizzato</span>
                     <span className="line-blue-horizontal" />
                   </h5>
+              <p className="custom-performance-note">
+                Basato sulle chiusure giornaliere rettificate per split e dividendi.
+              </p>
               <div className="date-inputs">
-                <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)} />
-                <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)} />
+                <input
+                  type="date"
+                  value={startDate}
+                  min={firstAvailableDate}
+                  max={lastAvailableDate}
+                  onChange={e => {
+                    setStartDate(e.target.value);
+                    setCustomPerformanceError("");
+                  }}
+                />
+                <input
+                  type="date"
+                  value={endDate}
+                  min={firstAvailableDate}
+                  max={lastAvailableDate}
+                  onChange={e => {
+                    setEndDate(e.target.value);
+                    setCustomPerformanceError("");
+                  }}
+                />
                 <button className="btn-primary" onClick={calculateCustomPerformance}>Calcola</button>
               </div>
+              {customPerformanceError && (
+                <div className="custom-performance-error">{customPerformanceError}</div>
+              )}
               {customPerformance && (
                 <div className="custom-result">
-                  <div>Prezzo iniziale: <b>{fmtEuro(customPerformance.initialPrice)}</b></div>
-                  <div>Prezzo finale: <b>{fmtEuro(customPerformance.finalPrice)}</b></div>
+                  <div>
+                    Chiusura iniziale ({customPerformance.actualStartDate}):
+                    <b>{fmtCurrency(customPerformance.initialPrice, currency)}</b>
+                  </div>
+                  <div>
+                    Chiusura finale ({customPerformance.actualEndDate}):
+                    <b>{fmtCurrency(customPerformance.finalPrice, currency)}</b>
+                  </div>
                   <div className={customPerformance.rendimento >= 0 ? "up" : "down"}>
                     Rendimento: <b>{customPerformance.rendimento.toFixed(2)}%</b>
                   </div>
@@ -739,9 +985,9 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
               <div className="range-combined">
                 <div className="range-wrapper">
                   <div className="range-header">
-                    <span className="range-min">{fmtEuro(ticker.info.dailyLow)}</span>
+                    <span className="range-min">{fmtCurrency(ticker.info.dailyLow, currency)}</span>
                     <span className="range-title">Daily Range</span>
-                    <span className="range-max">{fmtEuro(ticker.info.dailyHigh)}</span>
+                    <span className="range-max">{fmtCurrency(ticker.info.dailyHigh, currency)}</span>
                   </div>
                   <div className="range-bar range-daily">
                     <div
@@ -751,16 +997,16 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
                     <div
                       className="range-current"
                       style={{ left: `${percentInRange(ticker.info.dailyLow, ticker.info.dailyHigh, ticker.info.currentPrice)}%` }}
-                      title={`Prezzo attuale: ${fmtEuro(ticker.info.currentPrice)}`}
+                      title={`Prezzo attuale: ${fmtCurrency(ticker.info.currentPrice, currency)}`}
                     />
                   </div>
                 </div>
 
                 <div className="range-wrapper">
                   <div className="range-header">
-                    <span className="range-min">{fmtEuro(ticker.info["52WLow"])}</span>
+                    <span className="range-min">{fmtCurrency(ticker.info["52WLow"], currency)}</span>
                     <span className="range-title">52W Range</span>
-                    <span className="range-max">{fmtEuro(ticker.info["52WHigh"])}</span>
+                    <span className="range-max">{fmtCurrency(ticker.info["52WHigh"], currency)}</span>
                   </div>
                   <div className="range-bar range-52w">
                     <div
@@ -770,7 +1016,7 @@ export default function Search({ darkMode, watchlist = [], onAddToWatchlist }) {
                     <div
                       className="range-current"
                       style={{ left: `${percentInRange(ticker.info["52WLow"], ticker.info["52WHigh"], ticker.info.currentPrice)}%` }}
-                      title={`Prezzo attuale: ${fmtEuro(ticker.info.currentPrice)}`}
+                      title={`Prezzo attuale: ${fmtCurrency(ticker.info.currentPrice, currency)}`}
                     />
                   </div>
                 </div>

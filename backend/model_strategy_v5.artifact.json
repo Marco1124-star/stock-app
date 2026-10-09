@@ -1,0 +1,732 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "Strategia v5 per i modelli di rendimento azionario",
+    "description": "Valutazione tecnica dei modelli correnti e architettura consigliata per 1 mese, 3 mesi e 1 anno.",
+    "generatedAt": "2026-08-10T09:54:59+02:00",
+    "charts": [
+      {
+        "id": "mae_improvement_chart",
+        "title": "Miglioramento MAE rispetto alla baseline zero",
+        "subtitle": "Candidati v4 annuale e trimestrale; valori percentuali sopra zero indicano un errore inferiore.",
+        "showDescription": true,
+        "headerMarkdown": "Il confronto visivo mostra il segno e la dimensione del vantaggio; la tabella successiva conserva metriche e intervalli esatti.",
+        "intent": "comparison",
+        "question": "Quanto migliora o peggiora il MAE rispetto alla previsione sempre zero per ciascun candidato e orizzonte?",
+        "rationale": "Sei barre raggruppate rendono immediato il confronto tra due candidati e tre orizzonti, mantenendo la linea zero come benchmark.",
+        "comparisonContext": {
+          "baseline": "Previsione di rendimento sempre uguale a zero",
+          "grain": "Candidato per orizzonte",
+          "normalization": "(MAE baseline - MAE modello) / MAE baseline",
+          "unit": "%"
+        },
+        "type": "bar",
+        "dataset": "model_comparison",
+        "sourceId": "strategy_chart_query",
+        "encodings": {
+          "x": { "field": "horizon", "type": "ordinal", "label": "Orizzonte" },
+          "y": { "field": "relative_improvement_pct", "type": "quantitative", "label": "Miglioramento MAE relativo", "format": "number", "unit": "%" },
+          "color": { "field": "candidate", "type": "nominal", "label": "Candidato" },
+          "tooltip": [
+            { "field": "model_mae_pct", "type": "quantitative", "label": "MAE modello", "unit": "%" },
+            { "field": "baseline_mae_pct", "type": "quantitative", "label": "MAE zero", "unit": "%" },
+            { "field": "rank_ic", "type": "quantitative", "label": "Rank IC" },
+            { "field": "validation_status", "type": "text", "label": "Stato" }
+          ]
+        },
+        "xAxisTitle": "Orizzonte",
+        "yAxisTitle": "Miglioramento MAE relativo (%)",
+        "valueFormat": "number",
+        "unit": "%",
+        "layout": "full",
+        "labels": { "values": "all" },
+        "legend": { "position": "bottom", "sort": "spec", "title": "Candidato" },
+        "palette": { "kind": "categorical" },
+        "referenceLines": [
+          { "axis": "y", "value": 0, "label": "Baseline zero", "color": "neutral", "lineStyle": "dashed" }
+        ],
+        "settings": {
+          "groupMode": "grouped",
+          "orientation": "vertical",
+          "showValues": true,
+          "sort": "custom"
+        },
+        "surface": {
+          "surface": "card",
+          "compact": false,
+          "interactiveLegend": true,
+          "showControls": false,
+          "viewMode": "both"
+        }
+      }
+    ],
+    "tables": [
+      {
+        "id": "current_performance_table",
+        "title": "Prestazioni del candidato trimestrale v4",
+        "subtitle": "Holdout disponibile al 9 agosto 2026; MAE e copertura espressi in percentuale.",
+        "showDescription": true,
+        "dataset": "current_performance",
+        "sourceId": "quarterly_candidate",
+        "defaultSort": {
+          "field": "days",
+          "direction": "asc"
+        },
+        "density": "spacious",
+        "layout": "full",
+        "columns": [
+          { "field": "horizon", "label": "Orizzonte", "type": "text" },
+          { "field": "days", "label": "Giorni", "format": "number" },
+          { "field": "mae_pct", "label": "MAE modello (%)", "format": "number" },
+          { "field": "baseline_pct", "label": "MAE zero (%)", "format": "number" },
+          { "field": "relative_improvement_pct", "label": "Miglioramento relativo (%)", "format": "number", "movement": true },
+          { "field": "rank_ic", "label": "Rank IC", "format": "number" },
+          { "field": "rank_ic_ci95", "label": "CI 95% Rank IC", "type": "text" },
+          { "field": "coverage_pct", "label": "Copertura 80% (%)", "format": "number" },
+          { "field": "status", "label": "Stato", "type": "text" }
+        ]
+      },
+      {
+        "id": "data_quality_table",
+        "title": "Qualità e limiti del dataset point-in-time",
+        "subtitle": "Dataset trimestrale v4: 13.488 snapshot, 74 emittenti e 202 date.",
+        "showDescription": true,
+        "dataset": "data_quality",
+        "sourceId": "quarterly_dataset",
+        "defaultSort": {
+          "field": "priority",
+          "direction": "asc"
+        },
+        "density": "spacious",
+        "layout": "full",
+        "columns": [
+          { "field": "priority", "label": "#", "format": "number" },
+          { "field": "check_field", "label": "Controllo", "type": "text" },
+          { "field": "evidence", "label": "Evidenza", "type": "text" },
+          { "field": "impact", "label": "Impatto sul modello", "type": "text" }
+        ]
+      },
+      {
+        "id": "recommended_architecture_table",
+        "title": "Architettura consigliata per orizzonte",
+        "subtitle": "Modelli distinti perché frequenza informativa e obiettivo predittivo cambiano con l'orizzonte.",
+        "showDescription": true,
+        "dataset": "recommended_architecture",
+        "sourceId": "architecture_query",
+        "defaultSort": {
+          "field": "months",
+          "direction": "asc"
+        },
+        "density": "spacious",
+        "layout": "full",
+        "columns": [
+          { "field": "horizon", "label": "Orizzonte", "type": "text" },
+          { "field": "months", "label": "Mesi", "format": "number" },
+          { "field": "target", "label": "Target", "type": "text" },
+          { "field": "primary_model", "label": "Modello principale", "type": "text" },
+          { "field": "challengers", "label": "Challenger", "type": "text" },
+          { "field": "essential_features", "label": "Dati indispensabili", "type": "text" },
+          { "field": "production_policy", "label": "Regola di produzione", "type": "text" }
+        ]
+      },
+      {
+        "id": "promotion_gates_table",
+        "title": "Gate minimi proposti",
+        "subtitle": "Soglie di ricerca da confermare su holdout congelato e portafogli al netto dei costi.",
+        "showDescription": true,
+        "dataset": "promotion_gates",
+        "sourceId": "promotion_gates_query",
+        "defaultSort": {
+          "field": "months",
+          "direction": "asc"
+        },
+        "density": "spacious",
+        "layout": "full",
+        "columns": [
+          { "field": "horizon", "label": "Orizzonte", "type": "text" },
+          { "field": "months", "label": "Mesi", "format": "number" },
+          { "field": "mae_gate", "label": "MAE vs baseline", "type": "text" },
+          { "field": "rank_gate", "label": "Ranking", "type": "text" },
+          { "field": "uncertainty_gate", "label": "Incertezza", "type": "text" },
+          { "field": "economic_gate", "label": "Validità economica", "type": "text" }
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "id": "quarterly_candidate",
+        "label": "Candidato fondamentale v4 trimestrale",
+        "path": "models/fundamental_return_model_v4_quarterly_candidate.json",
+        "query": {
+          "engine": "sqlite",
+          "language": "sql",
+          "description": "Metriche holdout, bootstrap, calibrazione e stato di validazione per i tre orizzonti.",
+          "executed_at": "2026-08-10T09:45:00+02:00",
+          "tables_used": ["current_performance"],
+          "metric_definitions": ["Miglioramento MAE relativo = 100 * (MAE zero - MAE modello) / MAE zero"],
+          "sql": "WITH current_performance (horizon, days, mae_pct, baseline_pct, relative_improvement_pct, rank_ic, rank_ic_ci95, coverage_pct, status) AS (VALUES ('1 mese', 30, 7.5828, 7.5540, -0.3820, -0.0058, '[-0,0652; 0,0429]', 70.75, 'Non validato'), ('3 mesi', 90, 13.9352, 13.9480, 0.0914, -0.0375, '[-0,1559; 0,0756]', 67.39, 'Holdout non confermato'), ('1 anno', 365, 28.7716, 28.9273, 0.5383, 0.0607, '[0,0193; 0,0956]', 75.83, 'Validato nei gate correnti')) SELECT horizon, days, mae_pct, baseline_pct, relative_improvement_pct, rank_ic, rank_ic_ci95, coverage_pct, status FROM current_performance ORDER BY days;"
+        }
+      },
+      {
+        "id": "annual_candidate",
+        "label": "Candidato fondamentale v4 annuale",
+        "path": "models/fundamental_return_model_v4_annual_candidate.json",
+        "query": {
+          "engine": "local-json",
+          "description": "Confronto annuale del candidato v4.",
+          "executed_at": "2026-08-10T09:45:00+02:00"
+        }
+      },
+      {
+        "id": "quarterly_dataset",
+        "label": "Dataset point-in-time fondamentale v4 trimestrale",
+        "path": "models/fundamental_v4_quarterly_dataset.csv",
+        "query": {
+          "engine": "sqlite",
+          "language": "sql",
+          "description": "Profilo verificato di righe, emittenti, date, filing, missingness, unità e maturità delle label.",
+          "executed_at": "2026-08-10T09:49:00+02:00",
+          "filters": [
+            "Tutte le 13.488 righe del dataset trimestrale v4",
+            "Controlli al grain ticker + snapshot_date"
+          ],
+          "metric_definitions": [
+            "Feature coverage = feature non mancanti / 31",
+            "Label maturity = target non nullo / snapshot totali"
+          ],
+          "tables_used": ["data_quality"],
+          "sql": "WITH data_quality (priority, check_field, evidence, impact) AS (VALUES (1, 'Security master storico', '0 righe verificate su 13.488', 'Rischio alto di survivorship e delisting bias'), (2, 'Indipendenza del campione', '74 emittenti, 202 date, snapshot ripetuti per filing', 'Campione effettivo molto inferiore al numero di righe'), (3, 'Completezza delle feature', 'Copertura mediana 87,10%', 'Buona base, ma missingness potenzialmente settoriale'), (4, 'Feature molto mancanti', 'Interest coverage 49,28%; R&S 43,75%; net debt/EBITDA 35,53%', 'Servono settore/SIC e indicatori di missingness'), (5, 'Grain e unità', '0 duplicati ticker-data; 0 errori valuta/unità', 'Il dataset è coerente al grain dichiarato'), (6, 'Maturità delle label', '98,90% / 97,81% / 92,87% per 1m / 3m / 1y', 'Copertura delle label adeguata, con fisiologico calo a 1 anno')) SELECT priority, check_field, evidence, impact FROM data_quality ORDER BY priority;"
+        }
+      },
+      {
+        "id": "audit_notebook",
+        "label": "Notebook di audit fondamentale v4",
+        "path": "notebooks/fundamental_model_v4_audit.ipynb",
+        "query": {
+          "engine": "jupyter",
+          "description": "Companion notebook dell'audit; struttura valida, output non persistiti nel file."
+        }
+      },
+      {
+        "id": "strategy_evidence",
+        "label": "Evidenze e logica della strategia ML v5",
+        "path": "reports/model_strategy_v5_evidence.md"
+      },
+      {
+        "id": "architecture_query",
+        "label": "Query dell'architettura consigliata per orizzonte",
+        "path": "reports/model_strategy_v5_evidence.md",
+        "query": {
+          "engine": "sqlite",
+          "language": "sql",
+          "description": "Materializza la matrice di raccomandazione derivata dalle metriche locali e dalle fonti primarie.",
+          "executed_at": "2026-08-10T10:06:00+02:00",
+          "tables_used": ["recommended_architecture"],
+          "sql": "WITH recommended_architecture (horizon, months, target, primary_model, challengers, essential_features, production_policy) AS (VALUES ('1 mese', 1, 'Top-quintile o rendimento sector-neutral', 'CatBoost classifier/ranker con astensione', 'LightGBM/XGBoost ranker; regressione quantile', 'Momentum, volatilità, volumi, liquidità, gap, beta, eventi utili e revisioni', 'Nessuna previsione se segnale o calibrazione non superano i gate'), ('3 mesi', 3, 'Ranking cross-sectional sector-neutral per mese', 'LambdaMART raggruppato per data', 'CatBoost ranker; regressione Huber ausiliaria', 'Fondamentali trimestrali e accelerazioni, momentum, revisioni, settore/SIC', 'Pubblicare ranking; rendimento numerico solo se calibrato separatamente'), ('1 anno', 12, 'Rendimento market/sector-neutral a 12 mesi', 'XGBoost Huber mantenuto come champion sperimentale', 'CatBoost, Elastic Net/IPCA, LightGBM e blend OOF', 'Fondamentali TTM, variazioni, settore/SIC, regime macro e valutazione', 'Promozione indipendente dopo conferma non-overlap e vantaggio MAE robusto')) SELECT horizon, months, target, primary_model, challengers, essential_features, production_policy FROM recommended_architecture ORDER BY months;"
+        }
+      },
+      {
+        "id": "promotion_gates_query",
+        "label": "Query dei gate minimi proposti",
+        "path": "reports/model_strategy_v5_evidence.md",
+        "query": {
+          "engine": "sqlite",
+          "language": "sql",
+          "description": "Materializza i gate di ricerca proposti per validazione statistica ed economica.",
+          "executed_at": "2026-08-10T10:06:00+02:00",
+          "tables_used": ["promotion_gates"],
+          "sql": "WITH promotion_gates (horizon, months, mae_gate, rank_gate, uncertainty_gate, economic_gate) AS (VALUES ('1 mese', 1, 'Miglioramento relativo >= 2%', 'Rank IC >= 0,03; CI 95% inferiore > 0', 'Copertura 80% tra 75% e 85%; ampiezza monitorata', 'Spread top-bottom positivo dopo costi'), ('3 mesi', 3, 'Miglioramento relativo >= 1%', 'Rank IC >= 0,03; CI 95% inferiore > 0', 'Copertura 80% tra 75% e 85%; ampiezza monitorata', 'Spread top-bottom positivo dopo costi e turnover'), ('1 anno', 12, 'Miglioramento relativo > 1%', 'Rank IC >= 0,05; CI 95% inferiore > 0', 'Copertura 80% tra 75% e 85%; non-overlap disponibile', 'Stabilità per settore e regime; costi inclusi')) SELECT horizon, months, mae_gate, rank_gate, uncertainty_gate, economic_gate FROM promotion_gates ORDER BY months;"
+        }
+      },
+      {
+        "id": "strategy_chart_query",
+        "label": "Query di confronto MAE dei candidati v4",
+        "path": "reports/model_strategy_v5_chart.sql",
+        "query": {
+          "engine": "sqlite",
+          "language": "sql",
+          "description": "Materializza i sei valori verificati nei candidati annuale e trimestrale usati dal grafico.",
+          "executed_at": "2026-08-10T10:02:00+02:00",
+          "tables_used": ["model_comparison"],
+          "metric_definitions": ["Miglioramento MAE relativo = 100 * (MAE zero - MAE modello) / MAE zero"],
+          "sql": "WITH model_comparison (horizon, months, candidate, relative_improvement_pct, model_mae_pct, baseline_mae_pct, rank_ic, validation_status) AS (VALUES ('1 mese', 1, 'Annuale', -0.6103, 7.6001, 7.5540, 0.0080, 'Non validato'), ('1 mese', 1, 'Trimestrale', -0.3820, 7.5828, 7.5540, -0.0058, 'Non validato'), ('3 mesi', 3, 'Annuale', -0.0066, 13.9489, 13.9480, 0.0555, 'Non validato'), ('3 mesi', 3, 'Trimestrale', 0.0914, 13.9352, 13.9480, -0.0375, 'Holdout non confermato'), ('1 anno', 12, 'Annuale', -1.0122, 29.2201, 28.9273, 0.0540, 'Non validato'), ('1 anno', 12, 'Trimestrale', 0.5383, 28.7716, 28.9273, 0.0607, 'Validato nei gate correnti')) SELECT horizon, months, candidate, relative_improvement_pct, model_mae_pct, baseline_mae_pct, rank_ic, validation_status FROM model_comparison ORDER BY months, candidate;"
+        }
+      },
+      {
+        "id": "catboost_paper",
+        "label": "CatBoost: unbiased boosting with categorical features",
+        "href": "https://proceedings.neurips.cc/paper/2018/hash/14491b756b3a51daac41c24863285549-Abstract.html"
+      },
+      {
+        "id": "xgboost_rank_docs",
+        "label": "XGBoost Learning to Rank",
+        "href": "https://xgboost.readthedocs.io/en/release_3.2.0/tutorials/learning_to_rank.html"
+      },
+      {
+        "id": "asset_pricing_ml",
+        "label": "Empirical Asset Pricing via Machine Learning",
+        "href": "https://academic.oup.com/rfs/article/33/5/2223/5758276"
+      },
+      {
+        "id": "ipca_paper",
+        "label": "Characteristics are covariances: IPCA",
+        "href": "https://asu.elsevierpure.com/en/publications/characteristics-are-covariances-a-unified-model-of-risk-and-retur/"
+      },
+      {
+        "id": "tabular_tree_benchmark",
+        "label": "Tree-based models on typical tabular data",
+        "href": "https://proceedings.neurips.cc/paper_files/paper/2022/hash/0378c7692da36807bdec87ab043cdadc-Abstract-Datasets_and_Benchmarks.html"
+      },
+      {
+        "id": "tabpfn_paper",
+        "label": "TabPFN in Nature",
+        "href": "https://www.nature.com/articles/s41586-024-08328-6"
+      },
+      {
+        "id": "tabm_paper",
+        "label": "TabM at ICLR 2025",
+        "href": "https://proceedings.iclr.cc/paper_files/paper/2025/file/c1ba41c694834aeef91ae161711d4939-Paper-Conference.pdf"
+      },
+      {
+        "id": "ngboost_paper",
+        "label": "NGBoost at ICML 2020",
+        "href": "https://proceedings.mlr.press/v119/duan20a.html"
+      }
+    ],
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "body": "# Strategia v5 per i modelli di rendimento azionario"
+      },
+      {
+        "id": "technical_summary",
+        "type": "markdown",
+        "sourceId": "quarterly_candidate",
+        "body": "## Risultato tecnico: non serve un unico sostituto\n\n**La precisione non migliorerà in modo credibile passando semplicemente da XGBoost a LightGBM.** A 1 mese il modello è peggiore della baseline zero; a 3 mesi il vantaggio MAE è appena **0,09%** e il Rank IC è negativo; a 1 anno il Rank IC è **0,0607** con CI 95% interamente positivo.\n\nLa scelta corretta è quindi: mantenere XGBoost Huber a 1 anno come champion sperimentale; ricostruire 3 mesi come ranker cross-sectional; trasformare 1 mese in un modello market/event-driven che possa astenersi. La promozione deve avvenire separatamente per ciascun orizzonte."
+      },
+      {
+        "id": "metric_definitions",
+        "type": "markdown",
+        "body": "## Prima di confrontare i modelli: cosa significa ‘più preciso’\n\n**MAE** misura l'errore assoluto medio del rendimento numerico. **MAE zero** è l'errore di una previsione sempre uguale a zero. **Rank IC cross-sectional** è la correlazione di rango, per data, tra punteggi e rendimenti successivi: per selezionare titoli è spesso più importante del solo MAE. **Copertura 80%** indica quante osservazioni ricadono nell'intervallo dichiarato all'80%; deve essere vicina, ma non necessariamente identica, all'80%."
+      },
+      {
+        "id": "current_result_heading",
+        "type": "markdown",
+        "sourceId": "quarterly_candidate",
+        "body": "## Solo l'orizzonte annuale mostra oggi un segnale di ranking credibile\n\nIl vantaggio MAE è debole in tutti gli orizzonti e il suo intervallo bootstrap attraversa zero. A 1 anno, però, l'intervallo del Rank IC resta sopra zero: questo giustifica ulteriore sviluppo, non una promessa di rendimento."
+      },
+      {
+        "id": "mae_improvement_chart_block",
+        "type": "chart",
+        "chartId": "mae_improvement_chart",
+        "layout": "full"
+      },
+      {
+        "id": "current_result_table_block",
+        "type": "table",
+        "tableId": "current_performance_table",
+        "layout": "full"
+      },
+      {
+        "id": "data_heading",
+        "type": "markdown",
+        "sourceId": "quarterly_dataset",
+        "body": "## Il collo di bottiglia principale è il campione, non il booster\n\nLe **13.488** righe non equivalgono a 13.488 osservazioni indipendenti: ci sono soltanto **202 date**, snapshot ripetuti dello stesso filing e **74 emittenti**. Inoltre nessuna riga ha un security master storico verificato. Aggiungere titoli delistati, più emittenti e target relativi al mercato/settore ha probabilmente più valore di un'altra ricerca iperparametrica sul dataset attuale."
+      },
+      {
+        "id": "data_quality_table_block",
+        "type": "table",
+        "tableId": "data_quality_table",
+        "layout": "full"
+      },
+      {
+        "id": "architecture_heading",
+        "type": "markdown",
+        "body": "## Tre orizzonti richiedono tre problemi predittivi diversi\n\nA 1 mese i dati di bilancio sono troppo lenti per spiegare gran parte del movimento; servono prezzo, volume, volatilità, eventi e revisioni. A 3 mesi l'obiettivo deve premiare l'ordinamento dei titoli all'interno della stessa data. A 1 anno i fondamentali possono restare il nucleo del modello, con target neutralizzato e più diversità tra algoritmi."
+      },
+      {
+        "id": "architecture_table_block",
+        "type": "table",
+        "tableId": "recommended_architecture_table",
+        "layout": "full"
+      },
+      {
+        "id": "model_choices",
+        "type": "markdown",
+        "body": "## Quali modelli aggiungere, in ordine di priorità\n\n1. **CatBoost** è il primo challenger: ordered boosting e gestione nativa delle categoriche sono adatti a settore/SIC e missingness ([paper NeurIPS](https://proceedings.neurips.cc/paper/2018/hash/14491b756b3a51daac41c24863285549-Abstract.html)).\n2. **XGBoost/LightGBM LambdaMART** è il cambio più importante a 3 mesi: ogni mese diventa un gruppo e la loss ottimizza il ranking ([documentazione XGBoost](https://xgboost.readthedocs.io/en/release_3.2.0/tutorials/learning_to_rank.html)).\n3. **Ensemble OOF** di Ridge/Elastic Net, CatBoost e XGBoost/LightGBM: il meta-modello usa solo predizioni out-of-fold temporali e pesi non negativi.\n4. **IPCA o Elastic Net fattoriale** resta una baseline economica interpretabile, utile per distinguere segnale specifico da esposizione ai fattori ([IPCA](https://asu.elsevierpure.com/en/publications/characteristics-are-covariances-a-unified-model-of-risk-and-retur/)).\n5. **TabM e TabPFN** sono challenger di ricerca. Benchmark generali mostrano che gli alberi restano forti su dataset tabellari medi ([NeurIPS 2022](https://proceedings.neurips.cc/paper_files/paper/2022/hash/0378c7692da36807bdec87ab043cdadc-Abstract-Datasets_and_Benchmarks.html)); TabPFN è interessante su campioni fino a circa 10.000 righe ([Nature 2025](https://www.nature.com/articles/s41586-024-08328-6)), ma il panel temporale dipendente richiede test dedicati.\n6. **NGBoost, quantile boosting o conformal** migliorano soprattutto distribuzione e astensione, non garantiscono un MAE centrale inferiore ([NGBoost](https://proceedings.mlr.press/v119/duan20a.html)).\n\nNon userei ora LSTM, TFT o Transformer generici: il campione effettivo per data è troppo piccolo e il rischio di overfitting è alto."
+      },
+      {
+        "id": "validation_heading",
+        "type": "markdown",
+        "body": "## La promozione deve misurare utilità statistica ed economica\n\nIl confronto va eseguito con nested purged walk-forward, embargo almeno pari all'orizzonte, test finale congelato e bootstrap a blocchi. Per un modello di selezione azionaria vanno aggiunti spread top-bottom, turnover e costi; per un modello numerico restano MAE e calibrazione. Le soglie seguenti sono gate di ricerca, non garanzie universali."
+      },
+      {
+        "id": "promotion_gates_table_block",
+        "type": "table",
+        "tableId": "promotion_gates_table",
+        "layout": "full"
+      },
+      {
+        "id": "limitations",
+        "type": "markdown",
+        "body": "## Limiti e incertezza che cambiano il verdetto\n\n- L'universo corrente manuale introduce potenziale survivorship e delisting bias.\n- Il target attuale è raw; un target market- o sector-relative può cambiare sia ranking sia MAE.\n- I soli snapshot mensili ripetono informazioni di filing e riducono il campione effettivo.\n- Il candidato a 1 anno supera i gate correnti, ma il CI del vantaggio MAE attraversa zero e la diagnostica non-overlap non è disponibile.\n- Miglioramenti su dati storici non implicano rendimenti futuri; drift, costi e liquidità possono annullare il segnale."
+      },
+      {
+        "id": "next_steps",
+        "type": "markdown",
+        "body": "## Roadmap consigliata: prima dati e target, poi nuovi modelli\n\n1. Costruire un **security master storico** con delisted, cambi ticker e appartenenza settoriale point-in-time.\n2. Ampliare l'universo verso **1.000-3.000 titoli** e mantenere filing 10-K/10-Q point-in-time.\n3. Generare target **market- e sector-neutral**; separare previsione numerica e ranking.\n4. Aggiungere feature evento/mercato per 1 e 3 mesi: momentum 1/5/20/60 giorni, volatilità, volume/liquidità, beta, distanza dagli utili, sorpresa e revisioni.\n5. Implementare CatBoost e un ranker LambdaMART raggruppato per data; conservare XGBoost Huber a 1 anno.\n6. Costruire un ensemble OOF e promuovere ogni orizzonte in modo indipendente.\n7. Solo dopo, eseguire challenger TabM/TabPFN e NGBoost senza riutilizzare l'holdout."
+      },
+      {
+        "id": "further_questions",
+        "type": "markdown",
+        "body": "## Decisioni ancora aperte\n\n- Hai accesso storico a titoli delistati, prezzi/volumi e classificazioni settoriali point-in-time?\n- Per l'app è più importante mostrare un rendimento numerico oppure ordinare i titoli per opportunità?\n- Vuoi includere costi di transazione e un universo minimo di liquidità nel criterio di successo?\n\nQueste tre scelte determinano il target e contano più della differenza nominale tra XGBoost e LightGBM."
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-08-10T09:54:59+02:00",
+    "status": "ready",
+    "datasets": {
+      "model_comparison": [
+        {
+          "horizon": "1 mese",
+          "months": 1,
+          "candidate": "Annuale",
+          "relative_improvement_pct": -0.6103,
+          "model_mae_pct": 7.6001,
+          "baseline_mae_pct": 7.554,
+          "rank_ic": 0.008,
+          "validation_status": "Non validato"
+        },
+        {
+          "horizon": "1 mese",
+          "months": 1,
+          "candidate": "Trimestrale",
+          "relative_improvement_pct": -0.382,
+          "model_mae_pct": 7.5828,
+          "baseline_mae_pct": 7.554,
+          "rank_ic": -0.0058,
+          "validation_status": "Non validato"
+        },
+        {
+          "horizon": "3 mesi",
+          "months": 3,
+          "candidate": "Annuale",
+          "relative_improvement_pct": -0.0066,
+          "model_mae_pct": 13.9489,
+          "baseline_mae_pct": 13.948,
+          "rank_ic": 0.0555,
+          "validation_status": "Non validato"
+        },
+        {
+          "horizon": "3 mesi",
+          "months": 3,
+          "candidate": "Trimestrale",
+          "relative_improvement_pct": 0.0914,
+          "model_mae_pct": 13.9352,
+          "baseline_mae_pct": 13.948,
+          "rank_ic": -0.0375,
+          "validation_status": "Holdout non confermato"
+        },
+        {
+          "horizon": "1 anno",
+          "months": 12,
+          "candidate": "Annuale",
+          "relative_improvement_pct": -1.0122,
+          "model_mae_pct": 29.2201,
+          "baseline_mae_pct": 28.9273,
+          "rank_ic": 0.054,
+          "validation_status": "Non validato"
+        },
+        {
+          "horizon": "1 anno",
+          "months": 12,
+          "candidate": "Trimestrale",
+          "relative_improvement_pct": 0.5383,
+          "model_mae_pct": 28.7716,
+          "baseline_mae_pct": 28.9273,
+          "rank_ic": 0.0607,
+          "validation_status": "Validato nei gate correnti"
+        }
+      ],
+      "current_performance": [
+        {
+          "horizon": "1 mese",
+          "days": 30,
+          "mae_pct": 7.5828,
+          "baseline_pct": 7.554,
+          "relative_improvement_pct": -0.382,
+          "rank_ic": -0.0058,
+          "rank_ic_ci95": "[-0,0652; 0,0429]",
+          "coverage_pct": 70.75,
+          "status": "Non validato"
+        },
+        {
+          "horizon": "3 mesi",
+          "days": 90,
+          "mae_pct": 13.9352,
+          "baseline_pct": 13.948,
+          "relative_improvement_pct": 0.0914,
+          "rank_ic": -0.0375,
+          "rank_ic_ci95": "[-0,1559; 0,0756]",
+          "coverage_pct": 67.39,
+          "status": "Holdout non confermato"
+        },
+        {
+          "horizon": "1 anno",
+          "days": 365,
+          "mae_pct": 28.7716,
+          "baseline_pct": 28.9273,
+          "relative_improvement_pct": 0.5383,
+          "rank_ic": 0.0607,
+          "rank_ic_ci95": "[0,0193; 0,0956]",
+          "coverage_pct": 75.83,
+          "status": "Validato nei gate correnti"
+        }
+      ],
+      "data_quality": [
+        {
+          "priority": 1,
+          "check_field": "Security master storico",
+          "evidence": "0 righe verificate su 13.488",
+          "impact": "Rischio alto di survivorship e delisting bias"
+        },
+        {
+          "priority": 2,
+          "check_field": "Indipendenza del campione",
+          "evidence": "74 emittenti, 202 date, snapshot ripetuti per filing",
+          "impact": "Campione effettivo molto inferiore al numero di righe"
+        },
+        {
+          "priority": 3,
+          "check_field": "Completezza delle feature",
+          "evidence": "Copertura mediana 87,10%",
+          "impact": "Buona base, ma missingness potenzialmente settoriale"
+        },
+        {
+          "priority": 4,
+          "check_field": "Feature molto mancanti",
+          "evidence": "Interest coverage 49,28%; R&S 43,75%; net debt/EBITDA 35,53%",
+          "impact": "Servono settore/SIC e indicatori di missingness"
+        },
+        {
+          "priority": 5,
+          "check_field": "Grain e unità",
+          "evidence": "0 duplicati ticker-data; 0 errori valuta/unità",
+          "impact": "Il dataset è coerente al grain dichiarato"
+        },
+        {
+          "priority": 6,
+          "check_field": "Maturità delle label",
+          "evidence": "98,90% / 97,81% / 92,87% per 1m / 3m / 1y",
+          "impact": "Copertura delle label adeguata, con fisiologico calo a 1 anno"
+        }
+      ],
+      "recommended_architecture": [
+        {
+          "horizon": "1 mese",
+          "months": 1,
+          "target": "Top-quintile o rendimento sector-neutral",
+          "primary_model": "CatBoost classifier/ranker con astensione",
+          "challengers": "LightGBM/XGBoost ranker; regressione quantile",
+          "essential_features": "Momentum, volatilità, volumi, liquidità, gap, beta, eventi utili e revisioni",
+          "production_policy": "Nessuna previsione se segnale o calibrazione non superano i gate"
+        },
+        {
+          "horizon": "3 mesi",
+          "months": 3,
+          "target": "Ranking cross-sectional sector-neutral per mese",
+          "primary_model": "LambdaMART raggruppato per data",
+          "challengers": "CatBoost ranker; regressione Huber ausiliaria",
+          "essential_features": "Fondamentali trimestrali e accelerazioni, momentum, revisioni, settore/SIC",
+          "production_policy": "Pubblicare ranking; rendimento numerico solo se calibrato separatamente"
+        },
+        {
+          "horizon": "1 anno",
+          "months": 12,
+          "target": "Rendimento market/sector-neutral a 12 mesi",
+          "primary_model": "XGBoost Huber mantenuto come champion sperimentale",
+          "challengers": "CatBoost, Elastic Net/IPCA, LightGBM e blend OOF",
+          "essential_features": "Fondamentali TTM, variazioni, settore/SIC, regime macro e valutazione",
+          "production_policy": "Promozione indipendente dopo conferma non-overlap e vantaggio MAE robusto"
+        }
+      ],
+      "promotion_gates": [
+        {
+          "horizon": "1 mese",
+          "months": 1,
+          "mae_gate": "Miglioramento relativo >= 2%",
+          "rank_gate": "Rank IC >= 0,03; CI 95% inferiore > 0",
+          "uncertainty_gate": "Copertura 80% tra 75% e 85%; ampiezza monitorata",
+          "economic_gate": "Spread top-bottom positivo dopo costi"
+        },
+        {
+          "horizon": "3 mesi",
+          "months": 3,
+          "mae_gate": "Miglioramento relativo >= 1%",
+          "rank_gate": "Rank IC >= 0,03; CI 95% inferiore > 0",
+          "uncertainty_gate": "Copertura 80% tra 75% e 85%; ampiezza monitorata",
+          "economic_gate": "Spread top-bottom positivo dopo costi e turnover"
+        },
+        {
+          "horizon": "1 anno",
+          "months": 12,
+          "mae_gate": "Miglioramento relativo > 1%",
+          "rank_gate": "Rank IC >= 0,05; CI 95% inferiore > 0",
+          "uncertainty_gate": "Copertura 80% tra 75% e 85%; non-overlap disponibile",
+          "economic_gate": "Stabilità per settore e regime; costi inclusi"
+        }
+      ]
+    }
+  },
+  "sources": [
+    {
+      "id": "quarterly_candidate",
+      "label": "Candidato fondamentale v4 trimestrale",
+      "path": "models/fundamental_return_model_v4_quarterly_candidate.json",
+      "query": {
+          "engine": "sqlite",
+          "language": "sql",
+          "description": "Metriche holdout, bootstrap, calibrazione e stato di validazione per i tre orizzonti.",
+          "executed_at": "2026-08-10T09:45:00+02:00",
+          "tables_used": ["current_performance"],
+          "metric_definitions": ["Miglioramento MAE relativo = 100 * (MAE zero - MAE modello) / MAE zero"],
+          "sql": "WITH current_performance (horizon, days, mae_pct, baseline_pct, relative_improvement_pct, rank_ic, rank_ic_ci95, coverage_pct, status) AS (VALUES ('1 mese', 30, 7.5828, 7.5540, -0.3820, -0.0058, '[-0,0652; 0,0429]', 70.75, 'Non validato'), ('3 mesi', 90, 13.9352, 13.9480, 0.0914, -0.0375, '[-0,1559; 0,0756]', 67.39, 'Holdout non confermato'), ('1 anno', 365, 28.7716, 28.9273, 0.5383, 0.0607, '[0,0193; 0,0956]', 75.83, 'Validato nei gate correnti')) SELECT horizon, days, mae_pct, baseline_pct, relative_improvement_pct, rank_ic, rank_ic_ci95, coverage_pct, status FROM current_performance ORDER BY days;"
+      }
+    },
+    {
+      "id": "annual_candidate",
+      "label": "Candidato fondamentale v4 annuale",
+      "path": "models/fundamental_return_model_v4_annual_candidate.json",
+      "query": {
+        "engine": "local-json",
+        "description": "Confronto annuale del candidato v4.",
+        "executed_at": "2026-08-10T09:45:00+02:00"
+      }
+    },
+    {
+      "id": "quarterly_dataset",
+      "label": "Dataset point-in-time fondamentale v4 trimestrale",
+      "path": "models/fundamental_v4_quarterly_dataset.csv",
+      "query": {
+        "engine": "sqlite",
+        "language": "sql",
+        "description": "Profilo verificato di righe, emittenti, date, filing, missingness, unità e maturità delle label.",
+        "executed_at": "2026-08-10T09:49:00+02:00",
+        "filters": [
+          "Tutte le 13.488 righe del dataset trimestrale v4",
+          "Controlli al grain ticker + snapshot_date"
+        ],
+        "metric_definitions": [
+          "Feature coverage = feature non mancanti / 31",
+          "Label maturity = target non nullo / snapshot totali"
+        ],
+        "tables_used": ["data_quality"],
+        "sql": "WITH data_quality (priority, check_field, evidence, impact) AS (VALUES (1, 'Security master storico', '0 righe verificate su 13.488', 'Rischio alto di survivorship e delisting bias'), (2, 'Indipendenza del campione', '74 emittenti, 202 date, snapshot ripetuti per filing', 'Campione effettivo molto inferiore al numero di righe'), (3, 'Completezza delle feature', 'Copertura mediana 87,10%', 'Buona base, ma missingness potenzialmente settoriale'), (4, 'Feature molto mancanti', 'Interest coverage 49,28%; R&S 43,75%; net debt/EBITDA 35,53%', 'Servono settore/SIC e indicatori di missingness'), (5, 'Grain e unità', '0 duplicati ticker-data; 0 errori valuta/unità', 'Il dataset è coerente al grain dichiarato'), (6, 'Maturità delle label', '98,90% / 97,81% / 92,87% per 1m / 3m / 1y', 'Copertura delle label adeguata, con fisiologico calo a 1 anno')) SELECT priority, check_field, evidence, impact FROM data_quality ORDER BY priority;"
+      }
+    },
+    {
+      "id": "audit_notebook",
+      "label": "Notebook di audit fondamentale v4",
+      "path": "notebooks/fundamental_model_v4_audit.ipynb",
+      "query": {
+        "engine": "jupyter",
+        "description": "Companion notebook dell'audit; struttura valida, output non persistiti nel file."
+      }
+    },
+    {
+      "id": "strategy_evidence",
+      "label": "Evidenze e logica della strategia ML v5",
+      "path": "reports/model_strategy_v5_evidence.md"
+    },
+    {
+      "id": "architecture_query",
+      "label": "Query dell'architettura consigliata per orizzonte",
+      "path": "reports/model_strategy_v5_evidence.md",
+      "query": {
+        "engine": "sqlite",
+        "language": "sql",
+        "description": "Materializza la matrice di raccomandazione derivata dalle metriche locali e dalle fonti primarie.",
+        "executed_at": "2026-08-10T10:06:00+02:00",
+        "tables_used": ["recommended_architecture"],
+        "sql": "WITH recommended_architecture (horizon, months, target, primary_model, challengers, essential_features, production_policy) AS (VALUES ('1 mese', 1, 'Top-quintile o rendimento sector-neutral', 'CatBoost classifier/ranker con astensione', 'LightGBM/XGBoost ranker; regressione quantile', 'Momentum, volatilità, volumi, liquidità, gap, beta, eventi utili e revisioni', 'Nessuna previsione se segnale o calibrazione non superano i gate'), ('3 mesi', 3, 'Ranking cross-sectional sector-neutral per mese', 'LambdaMART raggruppato per data', 'CatBoost ranker; regressione Huber ausiliaria', 'Fondamentali trimestrali e accelerazioni, momentum, revisioni, settore/SIC', 'Pubblicare ranking; rendimento numerico solo se calibrato separatamente'), ('1 anno', 12, 'Rendimento market/sector-neutral a 12 mesi', 'XGBoost Huber mantenuto come champion sperimentale', 'CatBoost, Elastic Net/IPCA, LightGBM e blend OOF', 'Fondamentali TTM, variazioni, settore/SIC, regime macro e valutazione', 'Promozione indipendente dopo conferma non-overlap e vantaggio MAE robusto')) SELECT horizon, months, target, primary_model, challengers, essential_features, production_policy FROM recommended_architecture ORDER BY months;"
+      }
+    },
+    {
+      "id": "promotion_gates_query",
+      "label": "Query dei gate minimi proposti",
+      "path": "reports/model_strategy_v5_evidence.md",
+      "query": {
+        "engine": "sqlite",
+        "language": "sql",
+        "description": "Materializza i gate di ricerca proposti per validazione statistica ed economica.",
+        "executed_at": "2026-08-10T10:06:00+02:00",
+        "tables_used": ["promotion_gates"],
+        "sql": "WITH promotion_gates (horizon, months, mae_gate, rank_gate, uncertainty_gate, economic_gate) AS (VALUES ('1 mese', 1, 'Miglioramento relativo >= 2%', 'Rank IC >= 0,03; CI 95% inferiore > 0', 'Copertura 80% tra 75% e 85%; ampiezza monitorata', 'Spread top-bottom positivo dopo costi'), ('3 mesi', 3, 'Miglioramento relativo >= 1%', 'Rank IC >= 0,03; CI 95% inferiore > 0', 'Copertura 80% tra 75% e 85%; ampiezza monitorata', 'Spread top-bottom positivo dopo costi e turnover'), ('1 anno', 12, 'Miglioramento relativo > 1%', 'Rank IC >= 0,05; CI 95% inferiore > 0', 'Copertura 80% tra 75% e 85%; non-overlap disponibile', 'Stabilità per settore e regime; costi inclusi')) SELECT horizon, months, mae_gate, rank_gate, uncertainty_gate, economic_gate FROM promotion_gates ORDER BY months;"
+      }
+    },
+    {
+      "id": "strategy_chart_query",
+      "label": "Query di confronto MAE dei candidati v4",
+      "path": "reports/model_strategy_v5_chart.sql",
+      "query": {
+        "engine": "sqlite",
+        "language": "sql",
+        "description": "Materializza i sei valori verificati nei candidati annuale e trimestrale usati dal grafico.",
+        "executed_at": "2026-08-10T10:02:00+02:00",
+        "tables_used": ["model_comparison"],
+        "metric_definitions": ["Miglioramento MAE relativo = 100 * (MAE zero - MAE modello) / MAE zero"],
+        "sql": "WITH model_comparison (horizon, months, candidate, relative_improvement_pct, model_mae_pct, baseline_mae_pct, rank_ic, validation_status) AS (VALUES ('1 mese', 1, 'Annuale', -0.6103, 7.6001, 7.5540, 0.0080, 'Non validato'), ('1 mese', 1, 'Trimestrale', -0.3820, 7.5828, 7.5540, -0.0058, 'Non validato'), ('3 mesi', 3, 'Annuale', -0.0066, 13.9489, 13.9480, 0.0555, 'Non validato'), ('3 mesi', 3, 'Trimestrale', 0.0914, 13.9352, 13.9480, -0.0375, 'Holdout non confermato'), ('1 anno', 12, 'Annuale', -1.0122, 29.2201, 28.9273, 0.0540, 'Non validato'), ('1 anno', 12, 'Trimestrale', 0.5383, 28.7716, 28.9273, 0.0607, 'Validato nei gate correnti')) SELECT horizon, months, candidate, relative_improvement_pct, model_mae_pct, baseline_mae_pct, rank_ic, validation_status FROM model_comparison ORDER BY months, candidate;"
+      }
+    },
+    {
+      "id": "catboost_paper",
+      "label": "CatBoost: unbiased boosting with categorical features",
+      "href": "https://proceedings.neurips.cc/paper/2018/hash/14491b756b3a51daac41c24863285549-Abstract.html"
+    },
+    {
+      "id": "xgboost_rank_docs",
+      "label": "XGBoost Learning to Rank",
+      "href": "https://xgboost.readthedocs.io/en/release_3.2.0/tutorials/learning_to_rank.html"
+    },
+    {
+      "id": "asset_pricing_ml",
+      "label": "Empirical Asset Pricing via Machine Learning",
+      "href": "https://academic.oup.com/rfs/article/33/5/2223/5758276"
+    },
+    {
+      "id": "ipca_paper",
+      "label": "Characteristics are covariances: IPCA",
+      "href": "https://asu.elsevierpure.com/en/publications/characteristics-are-covariances-a-unified-model-of-risk-and-retur/"
+    },
+    {
+      "id": "tabular_tree_benchmark",
+      "label": "Tree-based models on typical tabular data",
+      "href": "https://proceedings.neurips.cc/paper_files/paper/2022/hash/0378c7692da36807bdec87ab043cdadc-Abstract-Datasets_and_Benchmarks.html"
+    },
+    {
+      "id": "tabpfn_paper",
+      "label": "TabPFN in Nature",
+      "href": "https://www.nature.com/articles/s41586-024-08328-6"
+    },
+    {
+      "id": "tabm_paper",
+      "label": "TabM at ICLR 2025",
+      "href": "https://proceedings.iclr.cc/paper_files/paper/2025/file/c1ba41c694834aeef91ae161711d4939-Paper-Conference.pdf"
+    },
+    {
+      "id": "ngboost_paper",
+      "label": "NGBoost at ICML 2020",
+      "href": "https://proceedings.mlr.press/v119/duan20a.html"
+    }
+  ],
+  "package_info": {
+    "root": ".",
+    "manifestPath": "model_strategy_v5.artifact.json",
+    "snapshotPath": "model_strategy_v5.artifact.json"
+  }
+}
